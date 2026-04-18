@@ -662,3 +662,4 @@ async function main() {
 }
 
 main();
+// Test improvement - add error handling
