@@ -1,0 +1,13 @@
+{
+  "name": "archibus-booking-bot",
+  "version": "2.0.0",
+  "description": "Deterministic Archibus workspace booking automation (native)",
+  "type": "module",
+  "scripts": {
+    "book": "node book.mjs",
+    "book:dry": "BOOKING_DRY_RUN=1 node book.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}
