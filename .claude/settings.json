@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(systemctl --user status bookingbot)",
+      "Bash(systemctl status:*)",
+      "Bash(crontab -l)",
+      "Bash(journalctl --user -u booking-bot.service --since today --no-pager)",
+      "Bash(journalctl --user -u booking-bot.service --since 'today 12:03:00' --no-pager)",
+      "Bash(journalctl --user -u booking-bot.service --since \"today 12:03:00\" --until \"today 12:20:00\" --no-pager)",
+      "Bash(journalctl --user -u booking-bot.service -n 20 --no-pager)",
+      "Bash(journalctl --user -u booking-bot.service --since \"today 12:05:00\" --no-pager)",
+      "Bash(journalctl --user -u booking-bot.service -r -n 5 --no-pager)",
+      "Bash(systemctl --user status booking-bot.service)",
+      "Bash(systemctl --user stop booking-bot.service)",
+      "Bash(source .env)",
+      "Bash(BOOKING_DRY_RUN=1 FORCE_BUILDING=A TARGET_DATE=2026-04-13 node book.mjs)",
+      "Bash(bash -c 'set -a; source .env; set +a; BOOKING_DRY_RUN=1 FORCE_BUILDING=A TARGET_DATE=2026-04-13 node book.mjs')",
+      "Bash(bash -c 'set -a; source .env; set +a; BOOKING_DRY_RUN=0 FORCE_BUILDING=A TARGET_DATE=2026-04-13 node book.mjs')"
+    ]
+  }
+}
