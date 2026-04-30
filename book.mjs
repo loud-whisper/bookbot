@@ -31,7 +31,7 @@ const CONFIG = {
             searchText: "Two Seventy",
             floor: "06",
             room: "WS06-072",
-            fallbackRoom: "WS06-052",
+            fallbackRooms: ["WS06-052"],
             fallbackPrefix: "WS06-",
         },
         B: {
@@ -39,8 +39,7 @@ const CONFIG = {
             searchText: "Orleans",
             floor: "02",
             room: "D2-106",
-            fallbackRoom: "D2-144",
-            fallbackRoom: "D2-146",
+            fallbackRooms: ["D2-144", "D2-146"],
             fallbackPrefix: "D2-",
         },
     },
@@ -394,57 +393,69 @@ async function attemptBooking() {
         // Wait for date input to confirm floor loaded
         await page.locator("#startDate").waitFor({ state: "visible", timeout: 20_000 });
 
-        // ── Wait for exactly 12:00:00 before selecting date ──────────────────
+        // ── Wait for exactly 12:00:05 before selecting date ─────────────────
+        // Strategy: bot is pre-loaded on the floor page by 11:59.
+        // We sit idle here until the strike time so we are first in line.
         const now = new Date();
-        if (now.getHours() === 11 && now.getMinutes() >= 58) {
-            const targetTime = new Date();
-            targetTime.setHours(12, 0, 0, 0);
-            const msToWait = targetTime.getTime() - now.getTime();
-            if (msToWait > 0) {
-                console.log(`[bot] Pre-loaded at ${now.toLocaleTimeString()}. Waiting ${Math.round(msToWait/1000)}s until 12:00:00 PM to select date and search…`);
-                // Sleep until ~500ms before noon, then tight-poll for precision
-                if (msToWait > 1000) {
-                    await sleep(msToWait - 500);
-                }
-                while (Date.now() < targetTime.getTime()) {
-                    // busy-wait for sub-millisecond precision
-                }
-                console.log(`[bot] Time is 12:00:00 PM. Executing Date Selection and Search!`);
+        const strikeHour = 12, strikeMin = 0, strikeSec = 5;
+        const targetTime = new Date();
+        targetTime.setHours(strikeHour, strikeMin, strikeSec, 0);
+        const msToWait = targetTime.getTime() - now.getTime();
+        if (msToWait > 0) {
+            console.log(`[bot] Pre-loaded at ${now.toLocaleTimeString()}. Waiting ${Math.round(msToWait/1000)}s until 12:00:05 to strike…`);
+            // Sleep until 600ms before strike, then tight-poll for precision
+            if (msToWait > 1000) {
+                await sleep(msToWait - 600);
             }
+            while (Date.now() < targetTime.getTime()) {
+                // busy-wait for sub-millisecond precision
+            }
+            console.log(`[bot] STRIKE TIME — 12:00:05. Executing Date Selection and Search!`);
+        } else if (msToWait < -60000) {
+            // Manual run or retry well after noon — no wait needed
+            console.log(`[bot] Running outside pre-load window (${now.toLocaleTimeString()}), proceeding immediately.`);
+        } else {
+            console.log(`[bot] Strike time already passed by ${Math.round(-msToWait/1000)}s, proceeding immediately.`);
         }
 
         // ── Step 5: Set Target Date ───────────────────────────────────────────
         console.log(`[bot] Step 5: Setting date to ${fmtDate(target)}…`);
 
         const dateInput = page.locator("#startDate");
-        // Wait for the date field to be stable — React date components need time
-        // to finish initializing after floor selection, especially under noon load.
-        // 5s was sometimes not enough on extremely busy days.
-        await sleep(10000);
+        // When pre-loaded (bot has been on the page since ~11:58), React is fully
+        // mounted. 2s is enough. For manual/retry runs we still wait 5s.
+        const preloadWait = msToWait <= 0 ? 5000 : 2000;
+        await sleep(preloadWait);
 
-        // Clear the field and type date character-by-character
-        await dateInput.click({ clickCount: 3 }); // select all
-        await page.keyboard.press("Delete");
-        await sleep(500);
-        await dateInput.pressSequentially(fmtDate(target), { delay: 100 });
-        await dateInput.press("Tab");
-        await sleep(1000);
+        // Primary: use React's internal setter for instant, reliable date injection
+        const dateSetViaEvaluate = await page.evaluate(({ selector, value }) => {
+            const el = document.querySelector(selector);
+            if (!el) return false;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, "value"
+            ).set;
+            nativeInputValueSetter.call(el, value);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+        }, { selector: "#startDate", value: fmtDate(target) });
 
-        // Verify the date stuck
+        if (dateSetViaEvaluate) {
+            await dateInput.press("Tab");
+            await sleep(500);
+        }
+
         let appliedDate = await dateInput.inputValue().catch(() => "");
+
+        // Fallback: character-by-character typing if evaluate() didn't stick
         if (appliedDate !== fmtDate(target)) {
-            console.log(`[bot] ⚠️ Date field shows "${appliedDate}" after pressSequentially, trying evaluate() fallback…`);
-            await page.evaluate(({ selector, value }) => {
-                const el = document.querySelector(selector);
-                if (!el) return;
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, "value"
-                ).set;
-                nativeInputValueSetter.call(el, value);
-                el.dispatchEvent(new Event("input", { bubbles: true }));
-                el.dispatchEvent(new Event("change", { bubbles: true }));
-            }, { selector: "#startDate", value: fmtDate(target) });
-            await sleep(1000);
+            console.log(`[bot] evaluate() date not confirmed (got "${appliedDate}"), falling back to pressSequentially…`);
+            await dateInput.click({ clickCount: 3 });
+            await page.keyboard.press("Delete");
+            await sleep(300);
+            await dateInput.pressSequentially(fmtDate(target), { delay: 80 });
+            await dateInput.press("Tab");
+            await sleep(800);
             appliedDate = await dateInput.inputValue().catch(() => "");
         }
 
@@ -479,26 +490,29 @@ async function attemptBooking() {
             bookedRoom = bldg.room;
         }
 
-        // Second choice: specific fallback room
-        if (!roomClicked && bldg.fallbackRoom) {
-            console.log(`[bot] ⚠️ Preferred room ${bldg.room} not available, trying second choice ${bldg.fallbackRoom}...`);
-            const secondChoice = page.locator(`text=${bldg.fallbackRoom}`).first();
-            if (await secondChoice.isVisible().catch(() => false)) {
-                console.log(`[bot] Found second choice room ${bldg.fallbackRoom}`);
-                const secondChoiceRow = page
-                    .locator(`li[aria-label^="Booking:"]`)
-                    .filter({ hasText: bldg.fallbackRoom })
-                    .first();
-                await openBookingPanelWithRetries(page, secondChoiceRow, bldg.fallbackRoom);
-                roomClicked = true;
-                bookedRoom = bldg.fallbackRoom;
-                usedFallback = true;
+        // Second choice: iterate named fallback rooms array (fixes D2-144 silently dropped bug)
+        if (!roomClicked && bldg.fallbackRooms?.length) {
+            for (const fbRoom of bldg.fallbackRooms) {
+                console.log(`[bot] ⚠️ Preferred room ${bldg.room} not available, trying named fallback ${fbRoom}…`);
+                const fbLocator = page.locator(`text=${fbRoom}`).first();
+                if (await fbLocator.isVisible().catch(() => false)) {
+                    console.log(`[bot] Found named fallback room ${fbRoom}`);
+                    const fbRow = page
+                        .locator(`li[aria-label^="Booking:"]`)
+                        .filter({ hasText: fbRoom })
+                        .first();
+                    await openBookingPanelWithRetries(page, fbRow, fbRoom);
+                    roomClicked = true;
+                    bookedRoom = fbRoom;
+                    usedFallback = true;
+                    break;
+                }
             }
         }
         // Fallback: any room matching the prefix
         if (!roomClicked) {
             console.log(
-                `[bot] ⚠️ Preferred room ${bldg.room} not available, looking for fallback prefix ${bldg.fallbackPrefix}…`
+                `[bot] ⚠️ No named fallbacks available, looking for any room with prefix ${bldg.fallbackPrefix}…`
             );
             usedFallback = true;
             const fallbackRoom = page
@@ -507,7 +521,7 @@ async function attemptBooking() {
                 .first();
             if (await fallbackRoom.isVisible().catch(() => false)) {
                 bookedRoom = (await fallbackRoom.textContent())?.trim() ?? "unknown";
-                console.log(`[bot] Using fallback room: ${bookedRoom}`);
+                console.log(`[bot] Using prefix-fallback room: ${bookedRoom}`);
                 await openBookingPanelWithRetries(page, fallbackRoom, bookedRoom);
                 roomClicked = true;
             }
@@ -573,14 +587,28 @@ async function attemptBooking() {
         // Also re-check the date input field directly
         const postSelectDate = await page.locator("#startDate").inputValue({ timeout: 5000 }).catch(() => "");
         if (postSelectDate && postSelectDate !== fmtDate(target)) {
-            console.log(`[bot] ⚠️ Date field reverted to "${postSelectDate}" after room selection! Re-setting to ${fmtDate(target)}…`);
+            console.log(`[bot] ⚠️ Date field reverted to "${postSelectDate}" after room selection! Attempting in-session recovery…`);
             await page.locator("#startDate").click({ clickCount: 3 });
             await page.keyboard.press("Delete");
-            await sleep(500);
-            await page.locator("#startDate").pressSequentially(fmtDate(target), { delay: 50 });
+            await sleep(300);
+            await page.evaluate(({ selector, value }) => {
+                const el = document.querySelector(selector);
+                if (!el) return;
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                nativeInputValueSetter.call(el, value);
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            }, { selector: "#startDate", value: fmtDate(target) });
             await page.locator("#startDate").press("Tab");
+            await sleep(800);
+            const recoveredDate = await page.locator("#startDate").inputValue().catch(() => "");
+            if (recoveredDate !== fmtDate(target)) {
+                throw new Error(`Date reverted to ${postSelectDate} and in-session recovery also failed (got ${recoveredDate})`);
+            }
+            console.log(`[bot] Date recovered to ${recoveredDate}. Re-running Search to reload rooms…`);
+            await page.locator("button:has-text('Search')").click();
             await sleep(2000);
-            throw new Error(`Date reverted to ${postSelectDate} after room selection — retry needed`);
+            throw new Error(`Date reverted to ${postSelectDate} — re-searched with corrected date, needs fresh room selection`);
         }
 
         if (!dateVerified) {

@@ -1,7 +1,7 @@
 # Archibus Booking Bot — Handoff Document
 
-> **Last updated**: 2026-03-21 by AI assistant
-> **Location**: `/mnt/wdc/BookingBot/`
+> **Last updated**: 2026-04-30 by AI assistant (Antigravity)
+> **Location**: `/mnt/apps/BookingBot/`
 
 ---
 
@@ -17,7 +17,7 @@ Automatically books workspace desks in **Archibus** (Eptura/Horizant) **29 days 
 | **Wednesday** | Thursday | **A** — 270 Albert St, Floor 06, Room WS06-072 |
 | **Thursday** | Friday | **B** — Place d'Orléans, Floor 02, Room D2-106 |
 
-Timer fires at **11:59:00 AM ET** (with 5s jitter) to pre-load menus and execute booking at exactly 12:00:00 PM.
+Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor page, then strikes at exactly **12:00:05 PM** to select date and search for rooms.
 
 ---
 
@@ -255,9 +255,42 @@ Added early-return block to `~/.bashrc` for `ANTIGRAVITY_AGENT` env var to preve
 | Mar 22 | Sun | Apr 20 (Mon) | A | — |
 | Mar 26 | Wed | Apr 24 (Thu) | A | — |
 | Mar 27 | Thu | Apr 25 (Fri) | B | — |
-| Apr 1  | Wed | Apr 30 (Thu) | A | ✅ Fedora booked WS06-072 / ❌ N5 failed (dupe — Fedora disabled) |
-| Apr 9  | Wed | May 8 (Thu) | B | ❌ All 3 attempts failed (timeout) |
-| Apr 12 | Sat | May 11 (Mon) | A | ❌ Attempt 1: date mismatch / ❌ Attempt 2: blank page / ✅ Attempt 3: success |
+| Apr 30 | Thu | May 29 (Fri) | B | ❌ Attempt 1: date mismatch (wrong summary date) / ✅ Attempt 2: booked D2-120 (fallback — D2-106 already gone) |
+
+---
+
+## Incident + Fix (2026-04-30)
+
+### Symptoms
+- Orleans (Building B) consistently misses preferred room D2-106 and fallback D2-144.
+- Attempt 1 always fails with summary date mismatch.
+- Attempt 2 succeeds but gets a random leftover room (D2-120, D2-190) because preferred rooms are taken by 12:03 PM.
+
+### Root Causes Found
+
+**1. Pre-load timing logic was in the wrong place.** The noon-wait code sat after Steps 1-4 (login + navigate to floor). The intent was: start at 11:59, pre-load, wait until noon. But under SPA load, login alone takes 8-15s, so the bot was not reaching the floor page until 12:00:15+ — the noon-wait was already expired and provided zero benefit.
+
+**2. Duplicate `fallbackRoom` key silently dropped D2-144.** Lines 42-43 both assigned `fallbackRoom:`. JavaScript silently kept only the last value (`D2-146`), so D2-144 was never tried.
+
+**3. RandomizedDelaySec=5 on the timer added unpredictability.** Combined with SPA load time, the bot could start as late as 11:59:05 and not reach the floor page until 12:00:20+.
+
+**4. sleep(10000) wasted 10s.** After reaching the floor page, the bot waited 10 full seconds "for React to initialize" — in a race for rooms, that is an eternity.
+
+**5. evaluate() was fallback, not primary.** The slower `pressSequentially` (100ms/char = ~1s for the full date) was tried first, with `evaluate()` only as backup. Now reversed.
+
+### Fixes Applied (2026-04-30)
+
+1. **Two-phase architecture**: Bot pre-loads login + building + floor during 11:58-11:59 window, then sits idle until exactly **12:00:05 PM** (user-requested strike time) before touching the date field.
+2. **Fixed `fallbackRooms` array**: Changed to `fallbackRooms: ["D2-144", "D2-146"]` — iterates through all named fallbacks in order.
+3. **Timer changed to 11:58:00, RandomizedDelaySec=0**: Deterministic start, 2 full minutes for pre-load.
+4. **Pre-date-fill wait reduced**: 10s → 2s when pre-loaded (React has been mounted for 2 minutes), 5s for manual/retry runs.
+5. **evaluate() is now primary date entry**: Instant React state injection. `pressSequentially` kept as fallback only.
+6. **In-session date-revert recovery**: Instead of immediately throwing to the 2-minute retry loop, the bot now re-sets the date via `evaluate()` and re-searches from the already-loaded floor page.
+
+### Expected Outcome
+- Bot is on the Orleans floor page by **11:59:30 AM** at the latest.
+- At exactly **12:00:05 PM**, it injects the date and clicks Search.
+- D2-106 (or D2-144/D2-146) should be available since no one else has had 5 seconds yet.
 
 ---
 
