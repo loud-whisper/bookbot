@@ -24,26 +24,28 @@ Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor pa
 ## Architecture
 
 ```
-/mnt/wdc/BookingBot/
-├── book.mjs           # Main Playwright script (~540 lines)
+/mnt/apps/BookingBot/
+├── book.mjs           # Main Playwright script (instance-aware)
+├── run-booking.sh     # Parallel Runner: launches 3 racers (Instance 1, 2, 3)
 ├── package.json       # Node.js deps (playwright ^1.52.0)
-├── .env               # Credentials + Telegram config (gitignored)
-├── run-booking.sh     # Wrapper: loads .env, runs node book.mjs
-├── .gitignore         # Excludes node_modules, screenshots, .env, logs
-└── screenshots/       # Bot saves screenshots at each step for debugging
+├── .env               # Credentials + Telegram config
+├── screenshots/       # Bot saves screenshots (prefixed with i1, i2, i3)
+└── /tmp/*.lock        # Atomic lock file to prevent double-booking
 ```
 
 ### Systemd Units (user-level)
 
 - **`~/.config/systemd/user/booking-bot.service`** — oneshot service, runs `run-booking.sh`
-- **`~/.config/systemd/user/booking-bot.timer`** — fires Sun/Wed/Thu 11:59:00, `Persistent=true`
+- **`~/.config/systemd/user/booking-bot.timer`** — fires Sun/Wed/Thu 11:58:00, `Persistent=true`
 
 ### Key Design Decisions
 
 1. **Native, not Docker** — moved from OpenClaw Docker container to native Node.js for simplicity and reliability.
 2. **Systemd user timer** — survives reboots (linger enabled), auto-runs missed jobs (`Persistent=true`).
 3. **Deterministic** — no LLM; same clicks every time. Fallback room logic if preferred room is taken.
-4. **Telegram notifications** — sends status (✅ booked, 🧪 dry run, ❌ failed, ⏭️ no-op) via bot API.
+4. **Parallel Racing** — launches 3 instances on Orleans days to target 3 different rooms simultaneously at 12:00:05.
+5. **Atomic Locking** — uses a `/tmp/*.lock` file with `O_EXCL` to ensure only one instance actually clicks "BOOK".
+6. **Telegram notifications** — sends status (✅ booked, 🧪 dry run, ❌ failed, ⏭️ no-op, 🤝 stood down) via bot API.
 
 ---
 
@@ -65,20 +67,22 @@ TELEGRAM_CHAT_ID=<chat_id>
 
 ## How It Works (Step by Step)
 
-1. Calculate target date: `today + 29 days`
-2. Wait until exactly 12:00:00 PM (tight-polls for sub-millisecond precision at noon)
-2. Check weekday map: Mon→A, Thu→A, Fri→B (otherwise no-op)
-3. Launch headless Chromium via Playwright
-4. Navigate to Archibus, log in (`#logon-user-input`, `#logon-password-input`)
-5. Select building from the list (or search by text)
-6. Click "Book workspaces"
-7. Select floor from sidebar (`a[aria-label*="Select floor XX"]`)
-8. Set date in `#startDate` (MM/DD/YYYY format), click Search
-9. Click preferred room (or fallback to any room with same prefix)
-10. Click "Myself" on the booking modal
-11. Click "BOOK" button
-12. Verify "Workspace is successfully booked!" confirmation
-13. Send Telegram notification with result
+1. Calculate target date: `today + 29 days`.
+2. **Parallel Launch**: `run-booking.sh` forks 3 `node book.mjs` processes with `BOOKING_INSTANCE=1,2,3`.
+3. **Pre-load Phase** (11:58:00 - 12:00:00):
+   - Navigate to Archibus, log in.
+   - Select building (Instance 1/2/3 each get a different primary room assigned).
+   - Select floor, wait on the search page.
+4. **Strike Phase** (12:00:05 PM):
+   - All 3 instances inject date via `evaluate()` and click Search simultaneously.
+5. **Coordination Phase**:
+   - Each instance finds its target room and opens the panel.
+   - **Critical**: Before clicking "BOOK", each instance tries to create `/tmp/booking-bot-YYYY-MM-DD.lock`.
+   - Winner (first to create file) clicks "BOOK".
+   - Losers see the lock file, log "Stood Down", and exit cleanly.
+6. Verify "Workspace is successfully booked!" confirmation.
+7. Send Telegram notification (Winner sends ✅, Losers send 🤝).
+8. Clean up: Release lock file on success or failure.
 
 ---
 
@@ -280,17 +284,23 @@ Added early-return block to `~/.bashrc` for `ANTIGRAVITY_AGENT` env var to preve
 
 ### Fixes Applied (2026-04-30)
 
-1. **Two-phase architecture**: Bot pre-loads login + building + floor during 11:58-11:59 window, then sits idle until exactly **12:00:05 PM** (user-requested strike time) before touching the date field.
-2. **Fixed `fallbackRooms` array**: Changed to `fallbackRooms: ["D2-144", "D2-146"]` — iterates through all named fallbacks in order.
-3. **Timer changed to 11:58:00, RandomizedDelaySec=0**: Deterministic start, 2 full minutes for pre-load.
-4. **Pre-date-fill wait reduced**: 10s → 2s when pre-loaded (React has been mounted for 2 minutes), 5s for manual/retry runs.
-5. **evaluate() is now primary date entry**: Instant React state injection. `pressSequentially` kept as fallback only.
-6. **In-session date-revert recovery**: Instead of immediately throwing to the 2-minute retry loop, the bot now re-sets the date via `evaluate()` and re-searches from the already-loaded floor page.
+1. **Two-phase architecture**: Bot pre-loads everything at 11:58 and sits idle until **12:00:05 PM** (strike time).
+2. **Parallel Racing**: Launches 3 instances (1, 2, 3) to claim different rooms (106, 144, 146) at the same millisecond.
+3. **Fixed `fallbackRooms` array**: Changed to `fallbackRooms: ["D2-144", "D2-146", "D2-768"]`.
+4. **Timer changed to 11:58:00, RandomizedDelaySec=0**: Deterministic start.
+5. **evaluate() date injection**: Instant React state setting instead of slow typing.
+6. **In-session date recovery**: Re-sets date and re-searches if the SPA reverts the date field, without restarting the browser.
 
-### Expected Outcome
-- Bot is on the Orleans floor page by **11:59:30 AM** at the latest.
-- At exactly **12:00:05 PM**, it injects the date and clicks Search.
-- D2-106 (or D2-144/D2-146) should be available since no one else has had 5 seconds yet.
+### Troubleshooting Multi-Instance
+- **Lock Files**: If the bot says "Lock already held", check `/tmp/booking-bot-YYYY-MM-DD.lock`. Delete it if a previous run crashed and left it behind.
+- **Instance Logs**: Look for `[bot][i1]`, `[bot][i2]`, or `[bot][i3]` in the logs to see which racer did what.
+- **Race Results**: It is normal to see one ✅ and two 🤝 (stood down) on successful days.
+
+### Expected Outcome (Orleans)
+- Instance 1 gets D2-106.
+- If D2-106 is gone, Instance 2 gets D2-144.
+- If both gone, Instance 3 gets D2-146.
+- All three act as safety nets for each other.
 
 ---
 
