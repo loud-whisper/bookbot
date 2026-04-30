@@ -10,6 +10,7 @@
 import { chromium } from "playwright";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import fs from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -24,6 +25,17 @@ const CONFIG = {
     user: process.env.BOOKING_USER,
     pass: process.env.BOOKING_PASS,
     dryRun: (process.env.BOOKING_DRY_RUN ?? "1") === "1",
+    // Instance number: 1, 2, or 3. Set via BOOKING_INSTANCE env var.
+    // Used for parallel multi-instance racing. Defaults to 1 (single-instance mode).
+    instance: parseInt(process.env.BOOKING_INSTANCE ?? "1", 10),
+
+    // Per-instance primary room for Building B (each racer targets a different room).
+    // Instance 1 → D2-106, Instance 2 → D2-144, Instance 3 → D2-146
+    // All share the same fallbackRooms list if their primary is unavailable.
+    instanceRooms: {
+        B: { 1: "D2-106", 2: "D2-144", 3: "D2-146" },
+        A: { 1: "WS06-072", 2: "WS06-072", 3: "WS06-072" }, // single room, first wins
+    },
 
     buildings: {
         A: {
@@ -39,7 +51,7 @@ const CONFIG = {
             searchText: "Orleans",
             floor: "02",
             room: "D2-106",
-            fallbackRooms: ["D2-144", "D2-146"],
+            fallbackRooms: ["D2-144", "D2-146", "D2-768"],
             fallbackPrefix: "D2-",
         },
     },
@@ -57,6 +69,39 @@ const CONFIG = {
     maxRetries: parseInt(process.env.BOOKING_MAX_RETRIES ?? "3", 10),
     retryDelayMs: parseInt(process.env.BOOKING_RETRY_DELAY_MS ?? "120000", 10), // 2 minutes
 };
+
+// ─── Lock File (multi-instance coordination) ────────────────────────────────
+// Prevents two parallel instances from both clicking BOOK for the same date.
+// Uses O_EXCL (atomic exclusive create) — only one process can create the file.
+function lockPath(d) {
+    return `/tmp/booking-bot-${fmtISO ? fmtISO(d) : d.toISOString().slice(0, 10)}.lock`;
+}
+
+function acquireLock(d, instance, room) {
+    const path = lockPath(d);
+    try {
+        const fd = fs.openSync(path, "wx"); // 'wx' = write + exclusive, throws EEXIST if taken
+        fs.writeSync(fd, JSON.stringify({ instance, room, timestamp: new Date().toISOString() }));
+        fs.closeSync(fd);
+        console.log(`[bot][i${instance}] Lock acquired for ${room} on ${path}`);
+        return { acquired: true };
+    } catch (err) {
+        if (err.code === "EEXIST") {
+            try {
+                const data = JSON.parse(fs.readFileSync(path, "utf8"));
+                console.log(`[bot][i${instance}] Lock already held by Instance ${data.instance} for room ${data.room}. Standing down.`);
+                return { acquired: false, winner: data };
+            } catch {
+                return { acquired: false, winner: null };
+            }
+        }
+        throw err; // unexpected FS error
+    }
+}
+
+function releaseLock(d) {
+    try { fs.unlinkSync(lockPath(d)); } catch { /* ignore */ }
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function targetDate() {
@@ -122,7 +167,7 @@ async function sendTelegram(text) {
 
 const STATUS_EMOJI = {
     booked: "✅", dry_run_pre_submit: "🧪", no_op: "⏭️", failed: "❌",
-    already_exists: "📌",
+    already_exists: "📌", stood_down: "🤝",
 };
 
 async function result(status, target, building, details) {
@@ -226,11 +271,28 @@ async function attemptBooking() {
         process.exit(0);
     }
 
-    const bldg = CONFIG.buildings[bldgKey];
+    const bldg = { ...CONFIG.buildings[bldgKey] }; // shallow clone so we can mutate
+    const instance = CONFIG.instance;
+
+    // In multi-instance mode, each racer targets its dedicated room for this building.
+    // Instance 1 → D2-106, Instance 2 → D2-144, Instance 3 → D2-146 (Building B)
+    // Building A: all instances target the same room; lock prevents double-booking.
+    const instanceRoom = CONFIG.instanceRooms[bldgKey]?.[instance];
+    if (instanceRoom && instanceRoom !== bldg.room) {
+        // This instance's primary is a fallback room — remove it from fallbackRooms to
+        // avoid trying the same room twice, then prepend the original primary as a fallback.
+        const originalPrimary = bldg.room;
+        bldg.room = instanceRoom;
+        bldg.fallbackRooms = [
+            originalPrimary,
+            ...(bldg.fallbackRooms ?? []).filter(r => r !== instanceRoom),
+        ];
+    }
+
     console.log(
-        `[bot] Booking for ${fmtISO(target)} (${weekdayName(target)}) → Building ${bldgKey}: ${bldg.name}`
+        `[bot][i${instance}] Booking for ${fmtISO(target)} (${weekdayName(target)}) → Building ${bldgKey}: ${bldg.name}`
     );
-    console.log(`[bot] Floor ${bldg.floor}, preferred room ${bldg.room}, dry_run=${CONFIG.dryRun}`);
+    console.log(`[bot][i${instance}] Floor ${bldg.floor}, primary room ${bldg.room}, dry_run=${CONFIG.dryRun}`);
 
     // Launch browser
     const headless = (process.env.HEADLESS ?? "1") !== "0";
@@ -626,8 +688,22 @@ async function attemptBooking() {
             process.exit(0);
         }
 
-        // ── Step 10: Click BOOK ───────────────────────────────────────────────
-        console.log("[bot] Step 10: Clicking BOOK…");
+        // ── Step 10: Acquire lock then click BOOK ─────────────────────────────
+        // Multi-instance coordination: atomically claim the right to book.
+        // If another instance already won the race, stand down gracefully.
+        const lockResult = acquireLock(target, instance, bookedRoom);
+        if (!lockResult.acquired) {
+            const winner = lockResult.winner;
+            const msg = winner
+                ? `Instance ${winner.instance} already booked room ${winner.room} — standing down`
+                : `Lock file exists (unknown winner) — standing down`;
+            console.log(`[bot][i${instance}] STOOD DOWN: ${msg}`);
+            await result("stood_down", target, bldgKey, msg);
+            await browser.close();
+            return; // clean exit, not an error
+        }
+
+        console.log(`[bot][i${instance}] Lock acquired. Clicking BOOK…`);
         const bookBtn = page.locator("button:has-text('BOOK')").first();
         await bookBtn.waitFor({ state: "visible", timeout: 15_000 });
         await bookBtn.click();
@@ -642,12 +718,15 @@ async function attemptBooking() {
 
         if (confirmation === "success") {
             await page.screenshot({ path: screenshotPath("booking_confirmed.png"), fullPage: true });
-            console.log("[bot] ✅ Booking confirmed!");
+            console.log(`[bot][i${instance}] Booking confirmed!`);
             await result("booked", target, bldgKey, roomDetail);
+            releaseLock(target); // clean up so next-day runs start fresh
         } else if (confirmation === "already_booked") {
-            console.log("[bot] 📌 Workspace already booked (likely by a previous attempt that timed out)");
+            console.log(`[bot][i${instance}] Workspace already booked (likely by a sibling instance or previous attempt)`);
+            releaseLock(target);
             await result("already_exists", target, bldgKey, `Workspace already booked. ${roomDetail}`);
         } else {
+            releaseLock(target); // release so other instances can try their room
             const pageMsg = await page.textContent("body").catch(() => "");
             await page.screenshot({ path: screenshotPath("booking_unknown.png"), fullPage: true });
             throw new Error(`BOOK click did not result in confirmation. Status: ${confirmation}. Page snippet: ${pageMsg.slice(0, 100)}...`);
