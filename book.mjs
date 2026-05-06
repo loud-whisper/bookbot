@@ -541,7 +541,14 @@ async function attemptBooking() {
         let bookedRoom = null;
         let usedFallback = false;
         const preferredRoom = page.locator(`text=${bldg.room}`).first();
-        if (await preferredRoom.isVisible().catch(() => false)) {
+        // Give the preferred room a real chance to render — Archibus paints
+        // rooms in batches, so a single isVisible() right after waitForSelector
+        // can return false even when the room is about to appear.
+        const preferredFound = await preferredRoom
+            .waitFor({ state: "visible", timeout: 15_000 })
+            .then(() => true)
+            .catch(() => false);
+        if (preferredFound) {
             console.log(`[bot] Found preferred room ${bldg.room}`);
             const preferredRoomRow = page
                 .locator(`li[aria-label^="Booking:"]`)
@@ -550,6 +557,22 @@ async function attemptBooking() {
             await openBookingPanelWithRetries(page, preferredRoomRow, bldg.room);
             roomClicked = true;
             bookedRoom = bldg.room;
+        } else {
+            // Second-chance recheck: sleep a few seconds and look once more.
+            // Cheap insurance against slow-rendering virtual lists before we
+            // commit to a fallback booking.
+            console.log(`[bot] Preferred room ${bldg.room} not seen yet — second-chance recheck in 5s…`);
+            await sleep(5000);
+            if (await preferredRoom.isVisible().catch(() => false)) {
+                console.log(`[bot] Found preferred room ${bldg.room} on recheck`);
+                const preferredRoomRow = page
+                    .locator(`li[aria-label^="Booking:"]`)
+                    .filter({ hasText: bldg.room })
+                    .first();
+                await openBookingPanelWithRetries(page, preferredRoomRow, bldg.room);
+                roomClicked = true;
+                bookedRoom = bldg.room;
+            }
         }
 
         // Second choice: iterate named fallback rooms array (fixes D2-144 silently dropped bug)
