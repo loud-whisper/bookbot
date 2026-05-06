@@ -1,6 +1,6 @@
 # Archibus Booking Bot — Handoff Document
 
-> **Last updated**: 2026-04-30 by AI assistant (Antigravity)
+> **Last updated**: 2026-05-06 by AI assistant (Claude Haiku, then Opus)
 > **Location**: `/mnt/apps/BookingBot/`
 
 ---
@@ -260,6 +260,43 @@ Added early-return block to `~/.bashrc` for `ANTIGRAVITY_AGENT` env var to preve
 | Mar 26 | Wed | Apr 24 (Thu) | A | — |
 | Mar 27 | Thu | Apr 25 (Fri) | B | — |
 | Apr 30 | Thu | May 29 (Fri) | B | ❌ Attempt 1: date mismatch (wrong summary date) / ✅ Attempt 2: booked D2-120 (fallback — D2-106 already gone) |
+
+---
+
+## Incident + Fix (2026-05-06)
+
+### Symptoms
+- Building A run for 2026-06-04 booked fallback room WS06-004 instead of preferred WS06-072.
+- User confirmed WS06-072 was actually available — bot reported it as unavailable in error.
+
+### Root Cause
+Race condition in room-detection timing. From the journal:
+- Instance 3 declared WS06-072 unavailable at 12:02:54 — only 3 seconds after Step 7 started.
+- Instance 1 found WS06-072 at 12:03:03 (16s) — had it ready to book.
+- Instance 2 found WS06-072 at 12:03:01 (5s) — had it ready to book.
+- Instance 3 grabbed the lock with the fallback room first, forcing Instances 1 and 2 to stand down with the preferred room in hand.
+
+The code path at `book.mjs:537–544` waited for *any* booking row (`li[aria-label^="Booking:"]`) to appear, then did a single instant `isVisible()` on the preferred room. Archibus paints booking rows in batches (virtual list), so the preferred row may not be in the DOM at that exact moment — leading to a false-negative fallback.
+
+Secondary issue: the per-date lock has no priority. A fast fallback booking can grab the lock before a sibling's slower preferred booking, inverting priority. Not patched yet — the timing fix alone should prevent the race.
+
+### Fix Applied
+Replaced the instant `isVisible()` with a 15-second `waitFor({ state: "visible" })` on the preferred-room locator, plus a 5-second second-chance recheck before falling back. Today's Instances 1 and 2 found WS06-072 well within this 20-second window — the patch would have caught it for Instance 3 too.
+
+```js
+// book.mjs:543-577 (after fix)
+const preferredFound = await preferredRoom
+    .waitFor({ state: "visible", timeout: 15_000 })
+    .then(() => true).catch(() => false);
+if (preferredFound) { ... }
+else {
+    await sleep(5000);
+    if (await preferredRoom.isVisible().catch(() => false)) { ... }
+}
+```
+
+### Validation
+Single-instance dry run on 2026-05-06 14:10 confirmed: full navigation, both wait windows fire as designed, stops cleanly at the BOOK click, Telegram notification delivered. Pushed to `loud-whisper/bookbot` as commit 8751c12 ahead of tomorrow's Friday 2026-06-05 Orleans (Building B) run.
 
 ---
 
