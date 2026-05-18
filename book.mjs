@@ -3,8 +3,13 @@
  * Archibus Workspace Booking Bot
  *
  * Deterministic Playwright script — no LLM needed.
- * Runs daily via cron, calculates target_date = today + 29d,
+ * Runs daily via timer, calculates target_date = today + 29d,
  * picks the correct building/floor/room, and submits the booking.
+ *
+ * Multi-instance coordination:
+ * - Each instance writes its live status to /tmp/booking-bot-{date}-i{N}.status
+ * - The winning instance writes /tmp/booking-bot-{date}.done on confirmation
+ * - All instances poll for the done file every 200ms and stand down instantly
  */
 
 import { chromium } from "playwright";
@@ -25,16 +30,14 @@ const CONFIG = {
     user: process.env.BOOKING_USER,
     pass: process.env.BOOKING_PASS,
     dryRun: (process.env.BOOKING_DRY_RUN ?? "1") === "1",
-    // Instance number: 1, 2, or 3. Set via BOOKING_INSTANCE env var.
-    // Used for parallel multi-instance racing. Defaults to 1 (single-instance mode).
     instance: parseInt(process.env.BOOKING_INSTANCE ?? "1", 10),
 
-    // Per-instance primary room for Building B (each racer targets a different room).
-    // Instance 1 → D2-106, Instance 2 → D2-144, Instance 3 → D2-146
-    // All share the same fallbackRooms list if their primary is unavailable.
+    // Each instance races for its own dedicated primary room.
+    // Instance 1 → D2-106, Instance 2 → D2-146, Instance 3 → D2-134
+    // All share the same fallbackRooms if their primary is unavailable.
     instanceRooms: {
-        B: { 1: "D2-106", 2: "D2-144", 3: "D2-146" },
-        A: { 1: "WS06-072", 2: "WS06-072", 3: "WS06-072" }, // single room, first wins
+        B: { 1: "D2-106", 2: "D2-146", 3: "D2-134" },
+        A: { 1: "WS06-072", 2: "WS06-072", 3: "WS06-072" },
     },
 
     buildings: {
@@ -44,88 +47,39 @@ const CONFIG = {
             floor: "06",
             room: "WS06-072",
             fallbackRooms: ["WS06-052"],
-            fallbackPrefix: "WS06-",
         },
         B: {
             name: "Place d'Orleans Shopping Centre 110 Place d'Orleans Drive (11832)",
             searchText: "Orleans",
             floor: "02",
             room: "D2-106",
-            fallbackRooms: ["D2-144", "D2-146", "D2-768"],
-            fallbackPrefix: "D2-",
+            // Only approved rooms. No wildcard fallback — unknown rooms are never booked.
+            fallbackRooms: ["D2-144", "D2-768", "D2-190-4"],
         },
     },
 
     // target weekday → building key  (0=Sun … 6=Sat)
-    // Mon(1)=A, Thu(4)=A, Fri(5)=B
-    weekdayMap: { 1: "A", 4: "A", 5: "B" },
+    // Mon(1)=A, Tue(2)=B, Thu(4)=A, Fri(5)=B
+    weekdayMap: { 1: "A", 2: "B", 4: "A", 5: "B" },
 
     timeoutMs: 60_000,
     panelOpenRetries: parseInt(process.env.BOOKING_PANEL_OPEN_RETRIES ?? "4", 10),
     panelOpenWaitMs: parseInt(process.env.BOOKING_PANEL_OPEN_WAIT_MS ?? "2000", 10),
     panelSignalTimeoutMs: parseInt(process.env.BOOKING_PANEL_SIGNAL_TIMEOUT_MS ?? "15000", 10),
 
-    // Retry config (for site slowness at noon)
     maxRetries: parseInt(process.env.BOOKING_MAX_RETRIES ?? "3", 10),
-    retryDelayMs: parseInt(process.env.BOOKING_RETRY_DELAY_MS ?? "120000", 10), // 2 minutes
+    retryDelayMs: parseInt(process.env.BOOKING_RETRY_DELAY_MS ?? "120000", 10),
 };
 
-// ─── Lock File (multi-instance coordination) ────────────────────────────────
-// Prevents two parallel instances from both clicking BOOK for the same date.
-// Uses O_EXCL (atomic exclusive create) — only one process can create the file.
-function lockPath(d) {
-    return `/tmp/booking-bot-${fmtISO ? fmtISO(d) : d.toISOString().slice(0, 10)}.lock`;
-}
-
-function acquireLock(d, instance, room) {
-    const path = lockPath(d);
-    try {
-        const fd = fs.openSync(path, "wx"); // 'wx' = write + exclusive, throws EEXIST if taken
-        fs.writeSync(fd, JSON.stringify({ instance, room, timestamp: new Date().toISOString() }));
-        fs.closeSync(fd);
-        console.log(`[bot][i${instance}] Lock acquired for ${room} on ${path}`);
-        return { acquired: true };
-    } catch (err) {
-        if (err.code === "EEXIST") {
-            try {
-                const data = JSON.parse(fs.readFileSync(path, "utf8"));
-                console.log(`[bot][i${instance}] Lock already held by Instance ${data.instance} for room ${data.room}. Standing down.`);
-                return { acquired: false, winner: data };
-            } catch {
-                return { acquired: false, winner: null };
-            }
-        }
-        throw err; // unexpected FS error
-    }
-}
-
-function releaseLock(d) {
-    try { fs.unlinkSync(lockPath(d)); } catch { /* ignore */ }
-}
-
 // ─── Helpers ────────────────────────────────────────────────────────────────
-function targetDate() {
-    // Override: TARGET_DATE=YYYY-MM-DD for testing
-    if (process.env.TARGET_DATE) {
-        const [y, m, d] = process.env.TARGET_DATE.split("-").map(Number);
-        return new Date(y, m - 1, d, 12, 0, 0, 0); // noon to avoid DST edge cases
-    }
-    const d = new Date();
-    // Archibus allows booking 29 days ahead (today = day 1)
-    // e.g. Sun Feb 15 → Mon Mar 16, Wed Feb 18 → Thu Mar 19
-    d.setDate(d.getDate() + 29);
-    return d;
+function fmtISO(d) {
+    return d.toISOString().slice(0, 10);
 }
 
 function fmtDate(d) {
-    // MM/DD/YYYY — the format the Archibus date picker uses
     const mm = String(d.getMonth() + 1).padStart(2, "0");
     const dd = String(d.getDate()).padStart(2, "0");
     return `${mm}/${dd}/${d.getFullYear()}`;
-}
-
-function fmtISO(d) {
-    return d.toISOString().slice(0, 10);
 }
 
 function weekdayName(d) {
@@ -134,9 +88,7 @@ function weekdayName(d) {
 
 function fmtLongDate(d) {
     return d.toLocaleDateString("en-US", {
-        month: "long",
-        day: "numeric",
-        year: "numeric",
+        month: "long", day: "numeric", year: "numeric",
         timeZone: "America/New_York",
     });
 }
@@ -145,12 +97,105 @@ function screenshotPath(name) {
     return join(SCREENSHOT_DIR, name);
 }
 
-// ─── Telegram ───────────────────────────────────────────────────────────────
+function targetDate() {
+    if (process.env.TARGET_DATE) {
+        const [y, m, d] = process.env.TARGET_DATE.split("-").map(Number);
+        return new Date(y, m - 1, d, 12, 0, 0, 0);
+    }
+    const d = new Date();
+    d.setDate(d.getDate() + 29);
+    return d;
+}
+
+async function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Lock File ──────────────────────────────────────────────────────────────
+function lockPath(d) {
+    return `/tmp/booking-bot-${fmtISO(d)}.lock`;
+}
+
+function acquireLock(d, instance, room) {
+    const path = lockPath(d);
+    try {
+        const fd = fs.openSync(path, "wx");
+        fs.writeSync(fd, JSON.stringify({ instance, room, timestamp: new Date().toISOString() }));
+        fs.closeSync(fd);
+        console.log(`[bot][i${instance}] Lock acquired for ${room}`);
+        return { acquired: true };
+    } catch (err) {
+        if (err.code === "EEXIST") {
+            try {
+                const data = JSON.parse(fs.readFileSync(path, "utf8"));
+                console.log(`[bot][i${instance}] Lock held by i${data.instance} for ${data.room} — standing down`);
+                return { acquired: false, winner: data };
+            } catch {
+                return { acquired: false, winner: null };
+            }
+        }
+        throw err;
+    }
+}
+
+function releaseLock(d) {
+    try { fs.unlinkSync(lockPath(d)); } catch { /* ignore */ }
+}
+
+// ─── Inter-instance Communication ───────────────────────────────────────────
+// Each instance owns its own status file — no write contention.
+// The done file is written once by the winner and signals all others to stop.
+
+function statusFilePath(d, inst) {
+    return `/tmp/booking-bot-${fmtISO(d)}-i${inst}.status`;
+}
+
+function doneFilePath(d) {
+    return `/tmp/booking-bot-${fmtISO(d)}.done`;
+}
+
+function writeStatus(d, inst, status) {
+    try {
+        fs.writeFileSync(statusFilePath(d, inst), status);
+        // Also log sibling statuses so journalctl shows the full picture
+        const siblings = {};
+        for (let i = 1; i <= 3; i++) {
+            if (i === inst) continue;
+            try { siblings[`i${i}`] = fs.readFileSync(statusFilePath(d, i), "utf8").trim(); }
+            catch { siblings[`i${i}`] = "-"; }
+        }
+        const siblingsStr = Object.entries(siblings).map(([k, v]) => `${k}:${v}`).join(" | ");
+        console.log(`[bot][i${inst}] ▶ ${status}  (${siblingsStr})`);
+    } catch { /* /tmp write failure is non-fatal */ }
+}
+
+function declareDone(d, inst, room) {
+    try {
+        fs.writeFileSync(doneFilePath(d), JSON.stringify({
+            instance: inst, room, ts: new Date().toISOString(),
+        }));
+        console.log(`[bot][i${inst}] ✅ Done file written — signalling siblings to stand down`);
+    } catch { /* non-fatal */ }
+}
+
+function checkDone(d, myInst) {
+    try {
+        const data = JSON.parse(fs.readFileSync(doneFilePath(d), "utf8"));
+        if (data.instance !== myInst) return data; // another instance won
+    } catch { /* file not there yet */ }
+    return null;
+}
+
+// ─── Stand-down Error ────────────────────────────────────────────────────────
+class StandDownError extends Error {
+    constructor(msg) { super(msg); this.name = "StandDownError"; }
+}
+
+// ─── Telegram ────────────────────────────────────────────────────────────────
 async function sendTelegram(text) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) return; // silently skip if not configured
-
+    if (!token || !chatId) return;
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
     try {
         const resp = await fetch(url, {
@@ -159,9 +204,9 @@ async function sendTelegram(text) {
             body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
         });
         if (!resp.ok) console.error(`[telegram] HTTP ${resp.status}: ${await resp.text()}`);
-        else console.log("[bot] Telegram notification sent ✅");
+        else console.log("[bot] Telegram notification sent");
     } catch (err) {
-        console.error(`[telegram] Failed to send: ${err.message}`);
+        console.error(`[telegram] Failed: ${err.message}`);
     }
 }
 
@@ -181,12 +226,9 @@ async function result(status, target, building, details) {
         timestamp: new Date().toISOString(),
     };
     console.log(JSON.stringify(out, null, 2));
-
-    // Send Telegram notification
     const emoji = STATUS_EMOJI[status] ?? "ℹ️";
     const msg = [
-        `${emoji} *Archibus Booking Bot*`,
-        ``,
+        `${emoji} *Archibus Booking Bot*`, ``,
         `Status: \`${status}\``,
         `Date: ${fmtISO(target)} (${weekdayName(target)})`,
         `Building: ${building ?? "none"}`,
@@ -194,47 +236,42 @@ async function result(status, target, building, details) {
         `Dry run: ${CONFIG.dryRun}`,
     ].join("\n");
     await sendTelegram(msg);
-
     return out;
 }
 
-async function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-}
-
+// ─── Panel helpers ───────────────────────────────────────────────────────────
 async function clickRoomAction(roomRow, roomLabel) {
     const actionBtn = roomRow
         .locator("button")
         .filter({ hasText: /workpoint-workstation/i })
         .first();
-
     if (await actionBtn.isVisible().catch(() => false)) {
         await actionBtn.click();
         console.log(`[bot] Opened booking panel via action button for ${roomLabel}`);
         return;
     }
-
     await roomRow.click({ timeout: 8000 });
     console.log(`[bot] Opened booking panel via row click for ${roomLabel}`);
 }
 
 async function bookingPanelIsVisible(page) {
-    const panelSignals = [
+    const signals = [
         page.getByText(/booking space for/i).first(),
         page.getByText(/myself/i).first(),
         page.locator("button:has-text('BOOK')").first(),
     ];
-
-    for (const signal of panelSignals) {
-        if (await signal.isVisible().catch(() => false)) return true;
+    for (const s of signals) {
+        if (await s.isVisible().catch(() => false)) return true;
     }
     return false;
 }
 
-async function openBookingPanelWithRetries(page, roomRow, roomLabel) {
+async function openBookingPanelWithRetries(page, roomRow, roomLabel, abortCheck) {
     for (let i = 1; i <= CONFIG.panelOpenRetries; i++) {
+        abortCheck?.();
         await clickRoomAction(roomRow, roomLabel);
         await sleep(CONFIG.panelOpenWaitMs);
+        abortCheck?.();
 
         if (await bookingPanelIsVisible(page)) return;
 
@@ -244,26 +281,23 @@ async function openBookingPanelWithRetries(page, roomRow, roomLabel) {
             .catch(() => false);
 
         if (await bookingPanelIsVisible(page)) return;
-        console.log(`[bot] Booking panel did not appear yet for ${roomLabel} (attempt ${i}/${CONFIG.panelOpenRetries})`);
-        // Dismiss any partially-open state before retrying
+        console.log(`[bot] Booking panel not yet open for ${roomLabel} (attempt ${i}/${CONFIG.panelOpenRetries})`);
         await page.keyboard.press("Escape").catch(() => {});
         await sleep(500);
     }
-
     throw new Error(`Booking panel did not open for ${roomLabel} after ${CONFIG.panelOpenRetries} attempts`);
 }
 
-// ─── Booking Attempt ────────────────────────────────────────────────────────
+// ─── Booking Attempt ─────────────────────────────────────────────────────────
 async function attemptBooking() {
-    // Validate credentials
     if (!CONFIG.user || !CONFIG.pass) {
         await result("failed", targetDate(), null, "BOOKING_USER or BOOKING_PASS not set");
-        process.exit(1); // no point retrying missing creds
+        process.exit(1);
     }
 
     const target = targetDate();
-    const dow = target.getDay(); // 0=Sun
-    // Override: FORCE_BUILDING=A|B for testing on any weekday
+    const instance = CONFIG.instance;
+    const dow = target.getDay();
     const bldgKey = process.env.FORCE_BUILDING || CONFIG.weekdayMap[dow];
 
     if (!bldgKey) {
@@ -271,36 +305,49 @@ async function attemptBooking() {
         process.exit(0);
     }
 
-    const bldg = { ...CONFIG.buildings[bldgKey] }; // shallow clone so we can mutate
-    const instance = CONFIG.instance;
+    // ── Abort / sleep helpers (closures over target + instance) ──────────────
+    function abort() {
+        const done = checkDone(target, instance);
+        if (done) {
+            writeStatus(target, instance, `stood_down:won_by_i${done.instance}:${done.room}`);
+            throw new StandDownError(`Instance ${done.instance} booked ${done.room} — standing down`);
+        }
+    }
 
-    // In multi-instance mode, each racer targets its dedicated room for this building.
-    // Instance 1 → D2-106, Instance 2 → D2-144, Instance 3 → D2-146 (Building B)
-    // Building A: all instances target the same room; lock prevents double-booking.
-    const instanceRoom = CONFIG.instanceRooms[bldgKey]?.[instance];
-    if (instanceRoom && instanceRoom !== bldg.room) {
-        // This instance's primary is a fallback room — remove it from fallbackRooms to
-        // avoid trying the same room twice, then prepend the original primary as a fallback.
+    async function abortableSleep(ms) {
+        const tick = 200;
+        let elapsed = 0;
+        while (elapsed < ms) {
+            const chunk = Math.min(tick, ms - elapsed);
+            await new Promise(r => setTimeout(r, chunk));
+            elapsed += chunk;
+            abort();
+        }
+    }
+
+    // ── Room assignment ───────────────────────────────────────────────────────
+    const bldg = { ...CONFIG.buildings[bldgKey] };
+    const instancePrimary = CONFIG.instanceRooms[bldgKey]?.[instance];
+    if (instancePrimary && instancePrimary !== bldg.room) {
         const originalPrimary = bldg.room;
-        bldg.room = instanceRoom;
+        bldg.room = instancePrimary;
         bldg.fallbackRooms = [
             originalPrimary,
-            ...(bldg.fallbackRooms ?? []).filter(r => r !== instanceRoom),
+            ...(bldg.fallbackRooms ?? []).filter(r => r !== instancePrimary),
         ];
     }
 
-    console.log(
-        `[bot][i${instance}] Booking for ${fmtISO(target)} (${weekdayName(target)}) → Building ${bldgKey}: ${bldg.name}`
-    );
+    writeStatus(target, instance, `started:primary=${bldg.room}`);
+    console.log(`[bot][i${instance}] Booking ${fmtISO(target)} (${weekdayName(target)}) → Building ${bldgKey}: ${bldg.name}`);
     console.log(`[bot][i${instance}] Floor ${bldg.floor}, primary room ${bldg.room}, dry_run=${CONFIG.dryRun}`);
 
-    // Launch browser
+    abort(); // bail early if a sibling already won before we even launch
+
     const headless = (process.env.HEADLESS ?? "1") !== "0";
-    console.log(`[bot] Launching browser (headless=${headless})…`);
     const browser = await chromium.launch({
         headless,
         args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-        slowMo: headless ? 0 : 500, // slow down for visual watching
+        slowMo: headless ? 0 : 500,
     });
     const context = await browser.newContext({
         viewport: { width: 1440, height: 900 },
@@ -312,281 +359,211 @@ async function attemptBooking() {
 
     try {
         // ── Step 1: Navigate & Login ──────────────────────────────────────────
+        writeStatus(target, instance, "navigating");
         console.log("[bot] Step 1: Navigating to Archibus login…");
         await page.goto(CONFIG.baseUrl, { waitUntil: "domcontentloaded" });
-        await sleep(5000); // let React SPA bootstrap
+        await abortableSleep(5000);
 
-        // Screenshot: what does the page look like after load?
         await page.screenshot({ path: screenshotPath("step1a_after_load.png"), fullPage: true });
         console.log(`[bot] Page title: ${await page.title()}`);
-        console.log(`[bot] Page URL: ${page.url()}`);
 
-        // Wait for React SPA to render the login form
-        console.log("[bot] Waiting for login form to render…");
         const loginForm = await page.waitForSelector("#logon-user-input", { timeout: 30_000 }).catch(() => null);
 
         if (!loginForm) {
-            // Maybe already logged in, or different page — but we can't trust the page state.
-            // The SPA may have loaded into a broken/blank state (seen in production: blank page
-            // with only "Contact the Archibus team" button, title "ARCHIBUS Workplace").
-            // Instead of assuming we're on the building list, verify by checking for actual content.
-            console.log("[bot] No login form found — checking if already past login…");
+            console.log("[bot] No login form — checking if already logged in…");
             await page.screenshot({ path: screenshotPath("step1b_no_login_form.png"), fullPage: true });
-            const title = await page.title();
             const bodyText = await page.textContent("body").catch(() => "");
-            console.log(`[bot] Current title: ${title}`);
-            console.log(`[bot] Body text length: ${bodyText.length} chars`);
-
-            // Require ACTUAL building-list content, not just a title match
             const hasBuildingContent = bodyText.includes("Search for a building") ||
                 bodyText.includes("Select a building") ||
                 bodyText.includes("Book workspaces") ||
                 bodyText.includes(bldg.searchText);
 
             if (hasBuildingContent) {
-                console.log("[bot] Already logged in with building list visible, proceeding…");
+                console.log("[bot] Already logged in, building list visible");
             } else {
-                // Page is in a bad state — force a fresh load of the login page
-                console.log("[bot] Page is in an invalid state (no building list found). Forcing fresh navigation…");
+                console.log("[bot] Bad page state — forcing fresh navigation…");
                 await page.goto(CONFIG.baseUrl, { waitUntil: "domcontentloaded" });
-                await sleep(5000);
+                await abortableSleep(5000);
                 const retryForm = await page.waitForSelector("#logon-user-input", { timeout: 30_000 }).catch(() => null);
-                if (!retryForm) {
-                    throw new Error(`Cannot reach login page after retry. Title: ${await page.title()}`);
-                }
-                // Fill and submit login
+                if (!retryForm) throw new Error(`Cannot reach login page after retry. Title: ${await page.title()}`);
                 await page.fill("#logon-user-input", CONFIG.user);
                 await page.fill("#logon-password-input", CONFIG.pass);
-                console.log("[bot] Credentials filled on retry");
                 await Promise.all([
-                    page.waitForResponse(resp => resp.url().includes("archibus") && resp.status() === 200, { timeout: 30_000 }).catch(() => null),
+                    page.waitForResponse(r => r.url().includes("archibus") && r.status() === 200, { timeout: 30_000 }).catch(() => null),
                     page.getByRole("button", { name: /log\s*in/i }).click(),
                 ]);
-                await sleep(8000);
-                console.log(`[bot] Post-retry-login title: ${await page.title()}`);
+                await abortableSleep(8000);
             }
         } else {
-            // Fill username
             await page.fill("#logon-user-input", CONFIG.user);
-            console.log("[bot] Username filled");
-
-            // Fill password
             await page.fill("#logon-password-input", CONFIG.pass);
-            console.log("[bot] Password filled");
-
             await page.screenshot({ path: screenshotPath("step1c_creds_filled.png"), fullPage: true });
-
-            // Click Log in and wait for navigation/SPA transition
-            console.log("[bot] Clicking Log in…");
             await Promise.all([
-                page.waitForResponse(resp => resp.url().includes("archibus") && resp.status() === 200, { timeout: 30_000 }).catch(() => null),
+                page.waitForResponse(r => r.url().includes("archibus") && r.status() === 200, { timeout: 30_000 }).catch(() => null),
                 page.getByRole("button", { name: /log\s*in/i }).click(),
             ]);
-
-            console.log("[bot] Login clicked, waiting for page transition…");
-            await sleep(8000); // generous wait for SPA transition
-
+            await abortableSleep(8000);
             await page.screenshot({ path: screenshotPath("step1d_after_login_click.png"), fullPage: true });
-            console.log(`[bot] Post-login title: ${await page.title()}`);
-            console.log(`[bot] Post-login URL: ${page.url()}`);
 
-            // Check if login succeeded — look for multiple possible indicators
             const pageText = await page.textContent("body").catch(() => "");
-            if (pageText.includes("Search for a building") || pageText.includes("Workplace")) {
-                console.log("[bot] ✅ Login successful — building list detected");
-            } else if (pageText.includes("Invalid") || pageText.includes("incorrect") || pageText.includes("failed")) {
+            if (pageText.includes("Invalid") || pageText.includes("incorrect") || pageText.includes("failed")) {
                 await result("failed", target, bldgKey, "Login failed — invalid credentials");
                 await browser.close();
-                process.exit(1); // no point retrying bad creds
-            } else {
-                // Still transitioning? Wait more
-                console.log("[bot] Page still transitioning, waiting longer…");
-                await sleep(10_000);
-                await page.screenshot({ path: screenshotPath("step1e_extended_wait.png"), fullPage: true });
-                console.log(`[bot] Extended wait title: ${await page.title()}`);
+                process.exit(1);
+            } else if (!pageText.includes("Search for a building") && !pageText.includes("Workplace")) {
+                await abortableSleep(10_000);
             }
         }
-        console.log("[bot] Step 1 complete — proceeding to building selection");
+
+        writeStatus(target, instance, "logged_in");
+        abort();
+        console.log("[bot] Step 1 complete");
 
         // ── Step 2: Select Building ───────────────────────────────────────────
         console.log(`[bot] Step 2: Selecting building ${bldgKey}…`);
-
-        // Try clicking the building by its full text
         const buildingLink = page.locator(`text=${bldg.name}`).first();
-        const buildingVisible = await buildingLink.isVisible().catch(() => false);
-
-        if (buildingVisible) {
+        if (await buildingLink.isVisible().catch(() => false)) {
             await buildingLink.click();
         } else {
-            // Building might require searching
             const searchInput = page.locator('input[placeholder*="Search for a building"]');
             if (await searchInput.isVisible().catch(() => false)) {
                 await searchInput.fill(bldg.searchText);
-                await sleep(1500);
+                await abortableSleep(1500);
             }
-            // Click the building after search
             await page.locator(`text=${bldg.name}`).first().click();
         }
-
-        // Wait for the "Book workspaces" card to appear (proves building page loaded)
         await page.locator("text=Book workspaces").first().waitFor({ state: "visible", timeout: 30_000 });
 
-        // ── Step 3: Click "Book workspaces" card ──────────────────────────────
+        abort();
+
+        // ── Step 3: Book workspaces ───────────────────────────────────────────
         console.log("[bot] Step 3: Opening 'Book workspaces'…");
         await page.locator("text=Book workspaces").first().click();
 
         // ── Step 4: Select Floor ──────────────────────────────────────────────
         console.log(`[bot] Step 4: Selecting floor ${bldg.floor}…`);
-
-        // Wait for the workspace booking page
         await page.waitForSelector("text=Workspace booking", { timeout: 20_000 });
-
-        // Click the floor in the left sidebar
-        const floorLink =
-            page.locator(`a[aria-label*="Select floor ${bldg.floor}"]`).first();
-        const floorVisible = await floorLink.isVisible().catch(() => false);
-
-        if (floorVisible) {
+        const floorLink = page.locator(`a[aria-label*="Select floor ${bldg.floor}"]`).first();
+        if (await floorLink.isVisible().catch(() => false)) {
             await floorLink.click();
         } else {
-            // Fallback: click by floor text
             await page.locator(`text="${bldg.floor}"`).first().click();
         }
-        // Wait for date input to confirm floor loaded
         await page.locator("#startDate").waitFor({ state: "visible", timeout: 20_000 });
 
-        // ── Wait for exactly 12:00:05 before selecting date ─────────────────
-        // Strategy: bot is pre-loaded on the floor page by 11:59.
-        // We sit idle here until the strike time so we are first in line.
+        writeStatus(target, instance, "floor_loaded");
+        abort();
+
+        // ── Wait for strike time ──────────────────────────────────────────────
         const now = new Date();
-        const strikeHour = 12, strikeMin = 0, strikeSec = 5;
-        const targetTime = new Date();
-        targetTime.setHours(strikeHour, strikeMin, strikeSec, 0);
-        const msToWait = targetTime.getTime() - now.getTime();
+        const strikeTime = new Date();
+        strikeTime.setHours(12, 0, 5, 0);
+        const msToWait = strikeTime.getTime() - now.getTime();
+
         if (msToWait > 0) {
-            console.log(`[bot] Pre-loaded at ${now.toLocaleTimeString()}. Waiting ${Math.round(msToWait/1000)}s until 12:00:05 to strike…`);
-            // Sleep until 600ms before strike, then tight-poll for precision
-            if (msToWait > 1000) {
-                await sleep(msToWait - 600);
-            }
-            while (Date.now() < targetTime.getTime()) {
-                // busy-wait for sub-millisecond precision
-            }
-            console.log(`[bot] STRIKE TIME — 12:00:05. Executing Date Selection and Search!`);
+            writeStatus(target, instance, `waiting_strike:${Math.round(msToWait / 1000)}s`);
+            console.log(`[bot][i${instance}] Pre-loaded. Waiting ${Math.round(msToWait / 1000)}s until 12:00:05…`);
+            if (msToWait > 600) await abortableSleep(msToWait - 600);
+            while (Date.now() < strikeTime.getTime()) { /* busy-wait last 600ms */ }
+            console.log(`[bot][i${instance}] STRIKE — 12:00:05`);
         } else if (msToWait < -60000) {
-            // Manual run or retry well after noon — no wait needed
-            console.log(`[bot] Running outside pre-load window (${now.toLocaleTimeString()}), proceeding immediately.`);
+            console.log(`[bot][i${instance}] Outside pre-load window, proceeding immediately`);
         } else {
-            console.log(`[bot] Strike time already passed by ${Math.round(-msToWait/1000)}s, proceeding immediately.`);
+            console.log(`[bot][i${instance}] Strike passed by ${Math.round(-msToWait / 1000)}s, proceeding`);
         }
 
-        // ── Step 5: Set Target Date ───────────────────────────────────────────
+        abort(); // last check before the race begins
+
+        // ── Step 5: Set Date ──────────────────────────────────────────────────
+        writeStatus(target, instance, "setting_date");
         console.log(`[bot] Step 5: Setting date to ${fmtDate(target)}…`);
-
         const dateInput = page.locator("#startDate");
-        // When pre-loaded (bot has been on the page since ~11:58), React is fully
-        // mounted. 2s is enough. For manual/retry runs we still wait 5s.
         const preloadWait = msToWait <= 0 ? 5000 : 2000;
-        await sleep(preloadWait);
+        await abortableSleep(preloadWait);
 
-        // Primary: use React's internal setter for instant, reliable date injection
-        const dateSetViaEvaluate = await page.evaluate(({ selector, value }) => {
-            const el = document.querySelector(selector);
-            if (!el) return false;
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, "value"
-            ).set;
-            nativeInputValueSetter.call(el, value);
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            return true;
-        }, { selector: "#startDate", value: fmtDate(target) });
-
-        if (dateSetViaEvaluate) {
-            await dateInput.press("Tab");
-            await sleep(500);
-        }
+        // Attempt 1: Playwright fill() — uses accessibility API, triggers React synthetic events
+        await dateInput.click();
+        await abortableSleep(200);
+        await dateInput.fill(fmtDate(target));
+        await dateInput.press("Tab");
+        await abortableSleep(500);
 
         let appliedDate = await dateInput.inputValue().catch(() => "");
-
-        // Fallback: character-by-character typing if evaluate() didn't stick
         if (appliedDate !== fmtDate(target)) {
-            console.log(`[bot] evaluate() date not confirmed (got "${appliedDate}"), falling back to pressSequentially…`);
-            await dateInput.click({ clickCount: 3 });
-            await page.keyboard.press("Delete");
-            await sleep(300);
-            await dateInput.pressSequentially(fmtDate(target), { delay: 80 });
+            // Attempt 2: digits-only — masked inputs insert slashes automatically,
+            // so typing MMDDYYYY without slashes bypasses the mask's interference
+            console.log(`[bot] fill() date not confirmed ("${appliedDate}"), trying digits-only…`);
+            const digitsOnly = fmtDate(target).replace(/\//g, "");
+            await dateInput.click();
+            await page.keyboard.press("Control+a");
+            await abortableSleep(100);
+            await page.keyboard.type(digitsOnly, { delay: 80 });
             await dateInput.press("Tab");
-            await sleep(800);
+            await abortableSleep(800);
             appliedDate = await dateInput.inputValue().catch(() => "");
         }
 
         if (appliedDate !== fmtDate(target)) {
-            throw new Error(`Date field did not keep target value. Expected ${fmtDate(target)}, got ${appliedDate || "(empty)"}`);
+            throw new Error(`Date field stuck. Expected ${fmtDate(target)}, got ${appliedDate || "(empty)"}`);
         }
         console.log(`[bot] Date confirmed: ${appliedDate}`);
 
-        // ── Step 6: Click Search ──────────────────────────────────────────────
+        // ── Step 6: Search ────────────────────────────────────────────────────
+        writeStatus(target, instance, "searching");
         console.log("[bot] Step 6: Clicking Search…");
         await page.locator("button:has-text('Search')").click();
-        await sleep(2000); // let results load
+        await abortableSleep(2000);
 
         // ── Step 7: Select Room ───────────────────────────────────────────────
         console.log(`[bot] Step 7: Looking for room ${bldg.room}…`);
-        console.log(`[bot] Waiting for rooms to load…`);
         await page.waitForSelector(`li[aria-label^="Booking:"]`, { timeout: 60_000 }).catch(() => null);
+        abort();
 
-        // Try preferred room first
         let roomClicked = false;
         let bookedRoom = null;
         let usedFallback = false;
+
+        // Try primary room
         const preferredRoom = page.locator(`text=${bldg.room}`).first();
-        // Give the preferred room a real chance to render — Archibus paints
-        // rooms in batches, so a single isVisible() right after waitForSelector
-        // can return false even when the room is about to appear.
         const preferredFound = await preferredRoom
             .waitFor({ state: "visible", timeout: 15_000 })
             .then(() => true)
             .catch(() => false);
+
         if (preferredFound) {
-            console.log(`[bot] Found preferred room ${bldg.room}`);
-            const preferredRoomRow = page
-                .locator(`li[aria-label^="Booking:"]`)
-                .filter({ hasText: bldg.room })
-                .first();
-            await openBookingPanelWithRetries(page, preferredRoomRow, bldg.room);
+            abort();
+            writeStatus(target, instance, `room_found:${bldg.room}`);
+            console.log(`[bot] Found primary room ${bldg.room}`);
+            const row = page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: bldg.room }).first();
+            await openBookingPanelWithRetries(page, row, bldg.room, abort);
             roomClicked = true;
             bookedRoom = bldg.room;
         } else {
-            // Second-chance recheck: sleep a few seconds and look once more.
-            // Cheap insurance against slow-rendering virtual lists before we
-            // commit to a fallback booking.
-            console.log(`[bot] Preferred room ${bldg.room} not seen yet — second-chance recheck in 5s…`);
-            await sleep(5000);
+            // Second-chance recheck before falling back
+            console.log(`[bot] Primary ${bldg.room} not visible yet — rechecking in 5s…`);
+            await abortableSleep(5000);
             if (await preferredRoom.isVisible().catch(() => false)) {
-                console.log(`[bot] Found preferred room ${bldg.room} on recheck`);
-                const preferredRoomRow = page
-                    .locator(`li[aria-label^="Booking:"]`)
-                    .filter({ hasText: bldg.room })
-                    .first();
-                await openBookingPanelWithRetries(page, preferredRoomRow, bldg.room);
+                abort();
+                writeStatus(target, instance, `room_found:${bldg.room}`);
+                console.log(`[bot] Found primary room ${bldg.room} on recheck`);
+                const row = page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: bldg.room }).first();
+                await openBookingPanelWithRetries(page, row, bldg.room, abort);
                 roomClicked = true;
                 bookedRoom = bldg.room;
             }
         }
 
-        // Second choice: iterate named fallback rooms array (fixes D2-144 silently dropped bug)
+        // Try named fallbacks
         if (!roomClicked && bldg.fallbackRooms?.length) {
             for (const fbRoom of bldg.fallbackRooms) {
-                console.log(`[bot] ⚠️ Preferred room ${bldg.room} not available, trying named fallback ${fbRoom}…`);
+                abort();
+                console.log(`[bot] Primary unavailable — trying named fallback ${fbRoom}…`);
                 const fbLocator = page.locator(`text=${fbRoom}`).first();
                 if (await fbLocator.isVisible().catch(() => false)) {
-                    console.log(`[bot] Found named fallback room ${fbRoom}`);
-                    const fbRow = page
-                        .locator(`li[aria-label^="Booking:"]`)
-                        .filter({ hasText: fbRoom })
-                        .first();
-                    await openBookingPanelWithRetries(page, fbRow, fbRoom);
+                    writeStatus(target, instance, `room_found:${fbRoom}(fallback)`);
+                    console.log(`[bot] Found fallback room ${fbRoom}`);
+                    const fbRow = page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: fbRoom }).first();
+                    await openBookingPanelWithRetries(page, fbRow, fbRoom, abort);
                     roomClicked = true;
                     bookedRoom = fbRoom;
                     usedFallback = true;
@@ -594,64 +571,39 @@ async function attemptBooking() {
                 }
             }
         }
-        // Fallback: any room matching the prefix
-        if (!roomClicked) {
-            console.log(
-                `[bot] ⚠️ No named fallbacks available, looking for any room with prefix ${bldg.fallbackPrefix}…`
-            );
-            usedFallback = true;
-            const fallbackRoom = page
-                .locator(`li[aria-label^="Booking:"]`)
-                .filter({ hasText: bldg.fallbackPrefix })
-                .first();
-            if (await fallbackRoom.isVisible().catch(() => false)) {
-                bookedRoom = (await fallbackRoom.textContent())?.trim() ?? "unknown";
-                console.log(`[bot] Using prefix-fallback room: ${bookedRoom}`);
-                await openBookingPanelWithRetries(page, fallbackRoom, bookedRoom);
-                roomClicked = true;
-            }
-        }
 
         if (!roomClicked) {
-            // Try clicking any available room at all
-            usedFallback = true;
-            const anyRoom = page.locator('li[aria-label^="Booking:"]').first();
-            if (await anyRoom.isVisible().catch(() => false)) {
-                bookedRoom = (await anyRoom.textContent())?.trim() ?? "unknown";
-                console.log(`[bot] Using first available room: ${bookedRoom}`);
-                await openBookingPanelWithRetries(page, anyRoom, bookedRoom);
-                roomClicked = true;
-            }
-        }
-
-        if (!roomClicked) {
-            await result("failed", target, bldgKey, `❗ Preferred room ${bldg.room} was NOT available and no fallback rooms found on the selected floor/date`);
+            writeStatus(target, instance, "failed:no_rooms");
+            await result("failed", target, bldgKey, `No approved rooms available for ${fmtISO(target)}`);
             await browser.close();
-            throw new Error(`No rooms available for ${fmtISO(target)}`);
+            throw new Error(`No approved rooms available for ${fmtISO(target)}`);
         }
+
+        writeStatus(target, instance, `panel_open:${bookedRoom}`);
+        abort();
 
         // ── Step 8: Click "Myself" ────────────────────────────────────────────
         console.log("[bot] Step 8: Clicking 'Myself'…");
         const myselfOption = page.getByText(/myself/i).first();
         await myselfOption.waitFor({ state: "visible", timeout: 25_000 });
         await myselfOption.click();
-        await sleep(3000); // Wait for summary to update
+        await abortableSleep(3000);
 
-        // Build result detail string with room info
+        writeStatus(target, instance, `myself_clicked:${bookedRoom}`);
+        abort();
+
         const roomDetail = usedFallback
-            ? `⚠️ Preferred room ${bldg.room} was NOT available. Booked fallback room: ${bookedRoom}`
+            ? `Preferred ${bldg.room} unavailable. Booked fallback: ${bookedRoom}`
             : `Booked preferred room: ${bookedRoom}`;
 
-        // ── Date re-verification ──────────────────────────────────────────────
-        console.log("[bot] Step 9: Verifying booking date before final click…");
+        // ── Step 9: Verify date ───────────────────────────────────────────────
+        console.log("[bot] Step 9: Verifying booking date…");
         const expectedSummaryDate = fmtLongDate(target);
-
-        // Poll for the correct summary date — under noon load, the SPA sometimes
-        // initially shows today's date before updating to the target date.
         let cleanSummaryText = "";
         let dateVerified = false;
+
         for (let poll = 0; poll < 5; poll++) {
-            // Search broadly — the summary panel has no special role/class attributes
+            abort();
             const allDateElements = await page.locator("text=Date:").locator("..").allTextContents().catch(() => []);
             const matching = allDateElements.find(t => t.includes(expectedSummaryDate));
             if (matching) {
@@ -660,79 +612,79 @@ async function attemptBooking() {
                 break;
             }
             if (poll === 0) {
-                const found = allDateElements.map(t => t.replace(/\s+/g, " ").trim()).filter(Boolean);
-                console.log(`[bot] Date elements found: ${JSON.stringify(found)}`);
+                console.log(`[bot] Date elements: ${JSON.stringify(allDateElements.map(t => t.replace(/\s+/g, " ").trim()).filter(Boolean))}`);
             }
-            console.log(`[bot] Summary date not yet correct (poll ${poll + 1}/5), waiting 4s…`);
-            await sleep(4000);
+            console.log(`[bot] Summary date not yet correct (poll ${poll + 1}/5)…`);
+            await abortableSleep(4000);
         }
 
-        console.log(`[bot] Detected summary date: "${cleanSummaryText}"`);
-
-        // Also re-check the date input field directly
         const postSelectDate = await page.locator("#startDate").inputValue({ timeout: 5000 }).catch(() => "");
         if (postSelectDate && postSelectDate !== fmtDate(target)) {
-            console.log(`[bot] ⚠️ Date field reverted to "${postSelectDate}" after room selection! Attempting in-session recovery…`);
+            console.log(`[bot] Date field reverted to "${postSelectDate}" — attempting recovery…`);
             await page.locator("#startDate").click({ clickCount: 3 });
             await page.keyboard.press("Delete");
-            await sleep(300);
+            await abortableSleep(300);
             await page.evaluate(({ selector, value }) => {
                 const el = document.querySelector(selector);
                 if (!el) return;
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-                nativeInputValueSetter.call(el, value);
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                setter.call(el, value);
                 el.dispatchEvent(new Event("input", { bubbles: true }));
                 el.dispatchEvent(new Event("change", { bubbles: true }));
             }, { selector: "#startDate", value: fmtDate(target) });
             await page.locator("#startDate").press("Tab");
-            await sleep(800);
-            const recoveredDate = await page.locator("#startDate").inputValue().catch(() => "");
-            if (recoveredDate !== fmtDate(target)) {
-                throw new Error(`Date reverted to ${postSelectDate} and in-session recovery also failed (got ${recoveredDate})`);
+            await abortableSleep(800);
+            const recovered = await page.locator("#startDate").inputValue().catch(() => "");
+            if (recovered !== fmtDate(target)) {
+                throw new Error(`Date reverted to ${postSelectDate} and recovery failed (got ${recovered})`);
             }
-            console.log(`[bot] Date recovered to ${recoveredDate}. Re-running Search to reload rooms…`);
+            console.log(`[bot] Date recovered. Re-running Search…`);
             await page.locator("button:has-text('Search')").click();
-            await sleep(2000);
-            throw new Error(`Date reverted to ${postSelectDate} — re-searched with corrected date, needs fresh room selection`);
+            await abortableSleep(2000);
+            throw new Error(`Date reverted — re-searched, needs fresh room selection`);
         }
 
         if (!dateVerified) {
-            await page.screenshot({ path: screenshotPath("booking_date_mismatch.png"), fullPage: true }).catch(() => { });
+            await page.screenshot({ path: screenshotPath("booking_date_mismatch.png"), fullPage: true }).catch(() => {});
             throw new Error(`Summary date mismatch. Expected ${expectedSummaryDate}, got "${cleanSummaryText || "missing"}"`);
         }
 
-        // ── Step 9.5: DRY RUN check ───────────────────────────────────────────
+        writeStatus(target, instance, `date_verified:${bookedRoom}`);
+        abort();
+
+        // ── Step 9.5: Dry run ─────────────────────────────────────────────────
         if (CONFIG.dryRun) {
-            console.log("[bot] ⚠️  DRY RUN — stopping before final BOOK click");
+            console.log("[bot] DRY RUN — stopping before BOOK click");
             await page.screenshot({ path: screenshotPath("booking_dry_run.png"), fullPage: true });
-            console.log(`[bot] Screenshot saved to ${screenshotPath("booking_dry_run.png")}`);
             await result("dry_run_pre_submit", target, bldgKey, `Stopped before BOOK click (dry run). ${roomDetail}`);
             await browser.close();
             process.exit(0);
         }
 
         // ── Step 10: Acquire lock then click BOOK ─────────────────────────────
-        // Multi-instance coordination: atomically claim the right to book.
-        // If another instance already won the race, stand down gracefully.
+        writeStatus(target, instance, `acquiring_lock:${bookedRoom}`);
         const lockResult = acquireLock(target, instance, bookedRoom);
         if (!lockResult.acquired) {
             const winner = lockResult.winner;
             const msg = winner
-                ? `Instance ${winner.instance} already booked room ${winner.room} — standing down`
-                : `Lock file exists (unknown winner) — standing down`;
-            console.log(`[bot][i${instance}] STOOD DOWN: ${msg}`);
+                ? `i${winner.instance} already holds lock for ${winner.room} — standing down`
+                : `Lock exists (unknown winner) — standing down`;
+            writeStatus(target, instance, `stood_down:lock`);
             await result("stood_down", target, bldgKey, msg);
             await browser.close();
-            return; // clean exit, not an error
+            return;
         }
 
-        console.log(`[bot][i${instance}] Lock acquired. Clicking BOOK…`);
+        writeStatus(target, instance, `clicking_book:${bookedRoom}`);
+        abort(); // one final check after lock acquired — before clicking
+
+        console.log(`[bot][i${instance}] Lock held. Clicking BOOK…`);
         const bookBtn = page.locator("button:has-text('BOOK')").first();
         await bookBtn.waitFor({ state: "visible", timeout: 15_000 });
         await bookBtn.click();
 
-        // ── Step 11: Confirm success ──────────────────────────────────────────
-        console.log("[bot] Step 11: Checking for confirmation…");
+        // ── Step 11: Confirm ──────────────────────────────────────────────────
+        console.log("[bot] Step 11: Waiting for confirmation…");
         const confirmation = await Promise.race([
             page.waitForSelector("text=Workspace is successfully booked", { timeout: 90_000 }).then(() => "success"),
             page.waitForSelector("text=already booked", { timeout: 90_000 }).then(() => "already_booked"),
@@ -741,50 +693,58 @@ async function attemptBooking() {
 
         if (confirmation === "success") {
             await page.screenshot({ path: screenshotPath("booking_confirmed.png"), fullPage: true });
+            writeStatus(target, instance, `booked:${bookedRoom}`);
+            declareDone(target, instance, bookedRoom); // signals all siblings to stand down NOW
             console.log(`[bot][i${instance}] Booking confirmed!`);
             await result("booked", target, bldgKey, roomDetail);
-            releaseLock(target); // clean up so next-day runs start fresh
-        } else if (confirmation === "already_booked") {
-            console.log(`[bot][i${instance}] Workspace already booked (likely by a sibling instance or previous attempt)`);
             releaseLock(target);
-            await result("already_exists", target, bldgKey, `Workspace already booked. ${roomDetail}`);
+        } else if (confirmation === "already_booked") {
+            writeStatus(target, instance, `already_booked:${bookedRoom}`);
+            releaseLock(target);
+            await result("already_exists", target, bldgKey, `Already booked. ${roomDetail}`);
         } else {
-            releaseLock(target); // release so other instances can try their room
+            releaseLock(target);
             const pageMsg = await page.textContent("body").catch(() => "");
             await page.screenshot({ path: screenshotPath("booking_unknown.png"), fullPage: true });
-            throw new Error(`BOOK click did not result in confirmation. Status: ${confirmation}. Page snippet: ${pageMsg.slice(0, 100)}...`);
+            throw new Error(`BOOK click — no confirmation. Status: ${confirmation}. Page: ${pageMsg.slice(0, 100)}…`);
         }
+
     } catch (err) {
-        console.error("[bot] ❌ Error:", err.message);
-        await page.screenshot({ path: screenshotPath("booking_error.png"), fullPage: true }).catch(() => { });
+        if (err.name === "StandDownError") throw err; // pass through cleanly, no screenshot
+        console.error("[bot] Error:", err.message);
+        writeStatus(target, instance, `failed:${err.message.slice(0, 60)}`);
+        await page.screenshot({ path: screenshotPath("booking_error.png"), fullPage: true }).catch(() => {});
         await result("failed", target, bldgKey ?? null, `Error: ${err.message}`);
-        throw err; // bubble up to retry loop
+        throw err;
     } finally {
         await browser.close();
     }
 }
 
-// ─── Main (with retry logic) ────────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
     for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
         try {
             console.log(`[bot] ═══ Attempt ${attempt}/${CONFIG.maxRetries} ═══`);
             await attemptBooking();
-            return; // success — exit
+            return;
         } catch (err) {
-            console.error(`[bot] ❌ Attempt ${attempt} failed: ${err.message}`);
-
+            if (err.name === "StandDownError") {
+                console.log(`[bot] Standing down: ${err.message}`);
+                return; // clean exit, no retry
+            }
+            console.error(`[bot] Attempt ${attempt} failed: ${err.message}`);
             if (attempt < CONFIG.maxRetries) {
                 const delayMin = Math.round(CONFIG.retryDelayMs / 60000);
-                console.log(`[bot] ⏳ Retrying in ${delayMin} minute(s)…`);
+                console.log(`[bot] Retrying in ${delayMin} minute(s)…`);
                 await sendTelegram(
                     `⏳ *Archibus Booking Bot*\n\nAttempt ${attempt}/${CONFIG.maxRetries} failed: ${err.message}\nRetrying in ${delayMin} min…`
                 );
                 await sleep(CONFIG.retryDelayMs);
             } else {
-                console.error(`[bot] ❌ All ${CONFIG.maxRetries} attempts exhausted.`);
+                console.error(`[bot] All ${CONFIG.maxRetries} attempts exhausted.`);
                 const target = targetDate();
-                await result("failed", target, null, `All ${CONFIG.maxRetries} attempts failed. Last error: ${err.message}`);
+                await result("failed", target, null, `All ${CONFIG.maxRetries} attempts failed. Last: ${err.message}`);
                 process.exit(1);
             }
         }
