@@ -451,6 +451,29 @@ async function attemptBooking() {
         }
         await page.locator("#startDate").waitFor({ state: "visible", timeout: 20_000 });
 
+        // Prime the date immediately while the React component is fresh.
+        // fill() silently fails if the field sits idle for ~100s — React goes stale.
+        {
+            const di = page.locator("#startDate");
+            await di.click();
+            await abortableSleep(200);
+            await di.fill(fmtDate(target));
+            await di.press("Tab");
+            await abortableSleep(500);
+            const primed = await di.inputValue().catch(() => "");
+            if (primed !== fmtDate(target)) {
+                const digitsOnly = fmtDate(target).replace(/\//g, "");
+                await di.click();
+                await page.keyboard.press("Control+a");
+                await abortableSleep(100);
+                await page.keyboard.type(digitsOnly, { delay: 80 });
+                await di.press("Tab");
+                await abortableSleep(800);
+            }
+            const primedFinal = await di.inputValue().catch(() => "");
+            console.log(`[bot] Date primed: ${primedFinal}`);
+        }
+
         writeStatus(target, instance, "floor_loaded");
         abort();
 
@@ -474,39 +497,42 @@ async function attemptBooking() {
 
         abort(); // last check before the race begins
 
-        // ── Step 5: Set Date ──────────────────────────────────────────────────
+        // ── Step 5: Verify/Re-set Date ────────────────────────────────────────
         writeStatus(target, instance, "setting_date");
-        console.log(`[bot] Step 5: Setting date to ${fmtDate(target)}…`);
         const dateInput = page.locator("#startDate");
-        const preloadWait = msToWait <= 0 ? 5000 : 2000;
-        await abortableSleep(preloadWait);
-
-        // Attempt 1: Playwright fill() — uses accessibility API, triggers React synthetic events
-        await dateInput.click();
-        await abortableSleep(200);
-        await dateInput.fill(fmtDate(target));
-        await dateInput.press("Tab");
-        await abortableSleep(500);
 
         let appliedDate = await dateInput.inputValue().catch(() => "");
-        if (appliedDate !== fmtDate(target)) {
-            // Attempt 2: digits-only — masked inputs insert slashes automatically,
-            // so typing MMDDYYYY without slashes bypasses the mask's interference
-            console.log(`[bot] fill() date not confirmed ("${appliedDate}"), trying digits-only…`);
-            const digitsOnly = fmtDate(target).replace(/\//g, "");
-            await dateInput.click();
-            await page.keyboard.press("Control+a");
-            await abortableSleep(100);
-            await page.keyboard.type(digitsOnly, { delay: 80 });
-            await dateInput.press("Tab");
-            await abortableSleep(800);
-            appliedDate = await dateInput.inputValue().catch(() => "");
-        }
+        if (appliedDate === fmtDate(target)) {
+            console.log(`[bot] Date confirmed (pre-set): ${appliedDate}`);
+        } else {
+            // Date was reset during the wait — try to set it again
+            console.log(`[bot] Step 5: Date reset to "${appliedDate}", re-setting to ${fmtDate(target)}…`);
+            await abortableSleep(msToWait <= 0 ? 5000 : 2000);
 
-        if (appliedDate !== fmtDate(target)) {
-            throw new Error(`Date field stuck. Expected ${fmtDate(target)}, got ${appliedDate || "(empty)"}`);
+            await dateInput.click();
+            await abortableSleep(200);
+            await dateInput.fill(fmtDate(target));
+            await dateInput.press("Tab");
+            await abortableSleep(500);
+
+            appliedDate = await dateInput.inputValue().catch(() => "");
+            if (appliedDate !== fmtDate(target)) {
+                const digitsOnly = fmtDate(target).replace(/\//g, "");
+                console.log(`[bot] fill() date not confirmed ("${appliedDate}"), trying digits-only…`);
+                await dateInput.click();
+                await page.keyboard.press("Control+a");
+                await abortableSleep(100);
+                await page.keyboard.type(digitsOnly, { delay: 80 });
+                await dateInput.press("Tab");
+                await abortableSleep(800);
+                appliedDate = await dateInput.inputValue().catch(() => "");
+            }
+
+            if (appliedDate !== fmtDate(target)) {
+                throw new Error(`Date field stuck. Expected ${fmtDate(target)}, got ${appliedDate || "(empty)"}`);
+            }
+            console.log(`[bot] Date confirmed: ${appliedDate}`);
         }
-        console.log(`[bot] Date confirmed: ${appliedDate}`);
 
         // ── Step 6: Search ────────────────────────────────────────────────────
         writeStatus(target, instance, "searching");
