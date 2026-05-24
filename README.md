@@ -238,6 +238,13 @@ Added early-return block to `~/.bashrc` for `ANTIGRAVITY_AGENT` env var to preve
 - **2026-02-14**: Created by AI assistant. Replaced OpenClaw AI automation with deterministic Playwright script.
 - **2026-02-18**: Migrated from Docker to native Node.js at `/mnt/wdc/BookingBot/`. Set up systemd user timer. Applied terminal blindness fix to `~/.bashrc`. Ran missed booking for Thu Mar 19 → ✅ Room WS06-072 booked.
 ## Recent Updates
+
+## 2026-05-24: Date field priming still failed during real pre-load
+
+Today's 11:58 pre-load run targeted **2026-06-22**, but all three instances logged `Date primed: 05/24/2026`. At the 12:00:05 strike, both `fill()` and digits-only typing still left the field at today's date, so attempt 1 missed the room window. Later retries confirmed `06/22/2026`, but the approved rooms were already gone.
+
+Fix: extracted `setStartDate()` and made both pre-load priming and strike-time recovery use the same confirmed setter. It now tries Playwright `fill()`, digits-only typing, and a native input-value setter with bubbled `input`/`change` events, repeating until `#startDate` actually reads the target date or failing before Search. Added `book.test.mjs` regression coverage for the fallback path. Dry run after the patch confirmed `Date primed: 06/22/2026` and `Date confirmed (pre-set): 06/22/2026` on the real Archibus page.
+
 - **2026-02-25**: Implemented "11:59 Pre-load and 12:00:15 Strike" strategy to beat website lag. Added 4-tier fallback logic (Preferred -> Specific Backup -> Prefix -> Any Room). Set up 3x Master Retry loop if final BOOK button drops request.
 - **2026-03-04**: Fixed busy-time booking modal flakiness by adding room-panel open retries and flexible panel detection (`Booking space for`/`Myself`/`BOOK`). Updated Step 8 selector strategy and corrected Building B fallback prefix to `D2-`. Verified with successful real booking for Thu 2026-04-02.
 - **2026-03-11**: Fixed systemd timeout killing the process (`TimeoutStartSec` 300→1200), fixed panel-retry 60s hang (`click({timeout:8000})`), raised panel signal timeout default to 15s, added Escape key to clear partial state before retries. Manually recovered missed booking for Thu 2026-04-09 → ✅ WS06-072 booked.

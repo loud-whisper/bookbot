@@ -82,6 +82,46 @@ function fmtDate(d) {
     return `${mm}/${dd}/${d.getFullYear()}`;
 }
 
+async function setStartDate(page, dateInput, expectedDate, abortableSleepFn = sleep) {
+    const digitsOnly = expectedDate.replace(/\//g, "");
+    const attempts = [
+        async () => {
+            await dateInput.click();
+            await abortableSleepFn(200);
+            await dateInput.fill(expectedDate);
+            await dateInput.press("Tab");
+        },
+        async () => {
+            await dateInput.click();
+            await page.keyboard.press("Control+a");
+            await abortableSleepFn(100);
+            await page.keyboard.type(digitsOnly, { delay: 80 });
+            await dateInput.press("Tab");
+        },
+        async () => {
+            await dateInput.evaluate((el, value) => {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                setter?.call(el, value);
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+                el.blur();
+            }, expectedDate);
+        },
+    ];
+
+    for (let round = 0; round < 3; round++) {
+        for (const attempt of attempts) {
+            await attempt();
+            await abortableSleepFn(800);
+            const appliedDate = await dateInput.inputValue().catch(() => "");
+            if (appliedDate === expectedDate) return appliedDate;
+        }
+    }
+
+    const finalDate = await dateInput.inputValue().catch(() => "");
+    throw new Error(`Date field stuck. Expected ${expectedDate}, got ${finalDate || "(empty)"}`);
+}
+
 function weekdayName(d) {
     return d.toLocaleDateString("en-US", { weekday: "long" });
 }
@@ -455,22 +495,7 @@ async function attemptBooking() {
         // fill() silently fails if the field sits idle for ~100s — React goes stale.
         {
             const di = page.locator("#startDate");
-            await di.click();
-            await abortableSleep(200);
-            await di.fill(fmtDate(target));
-            await di.press("Tab");
-            await abortableSleep(500);
-            const primed = await di.inputValue().catch(() => "");
-            if (primed !== fmtDate(target)) {
-                const digitsOnly = fmtDate(target).replace(/\//g, "");
-                await di.click();
-                await page.keyboard.press("Control+a");
-                await abortableSleep(100);
-                await page.keyboard.type(digitsOnly, { delay: 80 });
-                await di.press("Tab");
-                await abortableSleep(800);
-            }
-            const primedFinal = await di.inputValue().catch(() => "");
+            const primedFinal = await setStartDate(page, di, fmtDate(target), abortableSleep);
             console.log(`[bot] Date primed: ${primedFinal}`);
         }
 
@@ -509,28 +534,7 @@ async function attemptBooking() {
             console.log(`[bot] Step 5: Date reset to "${appliedDate}", re-setting to ${fmtDate(target)}…`);
             await abortableSleep(msToWait <= 0 ? 5000 : 2000);
 
-            await dateInput.click();
-            await abortableSleep(200);
-            await dateInput.fill(fmtDate(target));
-            await dateInput.press("Tab");
-            await abortableSleep(500);
-
-            appliedDate = await dateInput.inputValue().catch(() => "");
-            if (appliedDate !== fmtDate(target)) {
-                const digitsOnly = fmtDate(target).replace(/\//g, "");
-                console.log(`[bot] fill() date not confirmed ("${appliedDate}"), trying digits-only…`);
-                await dateInput.click();
-                await page.keyboard.press("Control+a");
-                await abortableSleep(100);
-                await page.keyboard.type(digitsOnly, { delay: 80 });
-                await dateInput.press("Tab");
-                await abortableSleep(800);
-                appliedDate = await dateInput.inputValue().catch(() => "");
-            }
-
-            if (appliedDate !== fmtDate(target)) {
-                throw new Error(`Date field stuck. Expected ${fmtDate(target)}, got ${appliedDate || "(empty)"}`);
-            }
+            appliedDate = await setStartDate(page, dateInput, fmtDate(target), abortableSleep);
             console.log(`[bot] Date confirmed: ${appliedDate}`);
         }
 
@@ -777,4 +781,8 @@ async function main() {
     }
 }
 
-main();
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    main();
+}
+
+export { fmtDate, setStartDate };
