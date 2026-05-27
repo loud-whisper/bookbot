@@ -33,10 +33,10 @@ const CONFIG = {
     instance: parseInt(process.env.BOOKING_INSTANCE ?? "1", 10),
 
     // Each instance races for its own dedicated primary room.
-    // Instance 1 → D2-106, Instance 2 → D2-146, Instance 3 → D2-134
+    // Instance 1 → D2-190-1, Instance 2 → D2-190-1, Instance 3 → D2-190-1
     // All share the same fallbackRooms if their primary is unavailable.
     instanceRooms: {
-        B: { 1: "D2-106", 2: "D2-146", 3: "D2-134" },
+        B: { 1: "D2-190-1", 2: "D2-190-1", 3: "D2-190-1" },
         A: { 1: "WS06-072", 2: "WS06-072", 3: "WS06-072" },
     },
 
@@ -52,9 +52,9 @@ const CONFIG = {
             name: "Place d'Orleans Shopping Centre 110 Place d'Orleans Drive (11832)",
             searchText: "Orleans",
             floor: "02",
-            room: "D2-106",
+            room: "D2-190-1",
             // Only approved rooms. No wildcard fallback — unknown rooms are never booked.
-            fallbackRooms: ["D2-144", "D2-768", "D2-190-4"],
+            fallbackRooms: ["D2-106", "D2-144", "D2-768", "D2-190-4"],
         },
     },
 
