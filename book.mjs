@@ -32,11 +32,11 @@ const CONFIG = {
     dryRun: (process.env.BOOKING_DRY_RUN ?? "1") === "1",
     instance: parseInt(process.env.BOOKING_INSTANCE ?? "1", 10),
 
-    // Each instance races for its own dedicated primary room.
-    // Instance 1 → D2-190-1, Instance 2 → D2-190-1, Instance 3 → D2-190-1
-    // All share the same fallbackRooms if their primary is unavailable.
+    // Each instance races for its own dedicated primary room simultaneously.
+    // B: i1→D2-190-1, i2→D2-106, i3→D2-144. Each falls back to the full priority list.
+    // A: all instances target WS06-072 (only one preferred room exists).
     instanceRooms: {
-        B: { 1: "D2-190-1", 2: "D2-190-1", 3: "D2-190-1" },
+        B: { 1: "D2-190-1", 2: "D2-106", 3: "D2-144" },
         A: { 1: "WS06-072", 2: "WS06-072", 3: "WS06-072" },
     },
 
@@ -560,7 +560,7 @@ async function attemptBooking() {
         // Try primary room
         const preferredRow = roomLocator(bldg.room);
         const preferredFound = await preferredRow
-            .waitFor({ state: "visible", timeout: 30_000 })
+            .waitFor({ state: "visible", timeout: 45_000 })
             .then(() => true)
             .catch(() => false);
 
