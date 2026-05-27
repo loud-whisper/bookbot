@@ -553,10 +553,14 @@ async function attemptBooking() {
         let bookedRoom = null;
         let usedFallback = false;
 
+        // Helper: locate a room strictly within the booking list items
+        const roomLocator = (name) =>
+            page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: name }).first();
+
         // Try primary room
-        const preferredRoom = page.locator(`text=${bldg.room}`).first();
-        const preferredFound = await preferredRoom
-            .waitFor({ state: "visible", timeout: 15_000 })
+        const preferredRow = roomLocator(bldg.room);
+        const preferredFound = await preferredRow
+            .waitFor({ state: "visible", timeout: 30_000 })
             .then(() => true)
             .catch(() => false);
 
@@ -564,35 +568,40 @@ async function attemptBooking() {
             abort();
             writeStatus(target, instance, `room_found:${bldg.room}`);
             console.log(`[bot] Found primary room ${bldg.room}`);
-            const row = page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: bldg.room }).first();
-            await openBookingPanelWithRetries(page, row, bldg.room, abort);
+            await openBookingPanelWithRetries(page, preferredRow, bldg.room, abort);
             roomClicked = true;
             bookedRoom = bldg.room;
         } else {
-            // Second-chance recheck before falling back
-            console.log(`[bot] Primary ${bldg.room} not visible yet — rechecking in 5s…`);
+            // Log what IS visible so we can diagnose misses
+            const visibleRooms = await page.locator(`li[aria-label^="Booking:"]`).allTextContents().catch(() => []);
+            console.log(`[bot] Primary ${bldg.room} not found. Visible rooms: ${visibleRooms.map(t => t.replace(/\s+/g, " ").trim()).join(" | ") || "(none)"}`);
+
+            // Second-chance recheck
+            console.log(`[bot] Rechecking in 5s…`);
             await abortableSleep(5000);
-            if (await preferredRoom.isVisible().catch(() => false)) {
+            if (await preferredRow.isVisible().catch(() => false)) {
                 abort();
                 writeStatus(target, instance, `room_found:${bldg.room}`);
                 console.log(`[bot] Found primary room ${bldg.room} on recheck`);
-                const row = page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: bldg.room }).first();
-                await openBookingPanelWithRetries(page, row, bldg.room, abort);
+                await openBookingPanelWithRetries(page, preferredRow, bldg.room, abort);
                 roomClicked = true;
                 bookedRoom = bldg.room;
             }
         }
 
-        // Try named fallbacks
+        // Try named fallbacks — give each a proper wait, not just a one-shot isVisible
         if (!roomClicked && bldg.fallbackRooms?.length) {
             for (const fbRoom of bldg.fallbackRooms) {
                 abort();
                 console.log(`[bot] Primary unavailable — trying named fallback ${fbRoom}…`);
-                const fbLocator = page.locator(`text=${fbRoom}`).first();
-                if (await fbLocator.isVisible().catch(() => false)) {
+                const fbRow = roomLocator(fbRoom);
+                const fbFound = await fbRow
+                    .waitFor({ state: "visible", timeout: 8_000 })
+                    .then(() => true)
+                    .catch(() => false);
+                if (fbFound) {
                     writeStatus(target, instance, `room_found:${fbRoom}(fallback)`);
                     console.log(`[bot] Found fallback room ${fbRoom}`);
-                    const fbRow = page.locator(`li[aria-label^="Booking:"]`).filter({ hasText: fbRoom }).first();
                     await openBookingPanelWithRetries(page, fbRow, fbRoom, abort);
                     roomClicked = true;
                     bookedRoom = fbRoom;
@@ -604,6 +613,7 @@ async function attemptBooking() {
 
         if (!roomClicked) {
             writeStatus(target, instance, "failed:no_rooms");
+            await page.screenshot({ path: screenshotPath("booking_no_rooms.png"), fullPage: true }).catch(() => {});
             await result("failed", target, bldgKey, `No approved rooms available for ${fmtISO(target)}`);
             await browser.close();
             throw new Error(`No approved rooms available for ${fmtISO(target)}`);
