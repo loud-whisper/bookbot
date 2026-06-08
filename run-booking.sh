@@ -9,6 +9,14 @@
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
+# Ensure user node manager (fnm) and local bin are in PATH for systemd --user service context
+export FNM_DIR="/home/headless/.local/share/fnm"
+if [ -d "$FNM_DIR" ]; then
+  export PATH="$FNM_DIR:$PATH"
+  eval "$(fnm env --shell bash)"
+fi
+export PATH="$HOME/.local/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
