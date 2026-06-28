@@ -82,6 +82,12 @@ function fmtDate(d) {
     return `${mm}/${dd}/${d.getFullYear()}`;
 }
 
+function searchRefreshTime(now = new Date()) {
+    const refreshTime = new Date(now);
+    refreshTime.setHours(12, 0, 30, 0);
+    return refreshTime;
+}
+
 async function setStartDate(page, dateInput, expectedDate, abortableSleepFn = sleep) {
     const digitsOnly = expectedDate.replace(/\//g, "");
     const attempts = [
@@ -328,6 +334,31 @@ async function openBookingPanelWithRetries(page, roomRow, roomLabel, abortCheck)
     throw new Error(`Booking panel did not open for ${roomLabel} after ${CONFIG.panelOpenRetries} attempts`);
 }
 
+async function selectFloor(page, bldg) {
+    await page.waitForSelector("text=Workspace booking", { timeout: 20_000 });
+    const floorLink = page.locator(`a[aria-label*="Select floor ${bldg.floor}"]`).first();
+    if (await floorLink.isVisible().catch(() => false)) {
+        await floorLink.click();
+    } else {
+        await page.locator(`text="${bldg.floor}"`).first().click();
+    }
+    await page.locator("#startDate").waitFor({ state: "visible", timeout: 20_000 });
+}
+
+async function dateInputAfterRefresh(page, bldg) {
+    const dateInput = page.locator("#startDate");
+    const visible = await dateInput
+        .waitFor({ state: "visible", timeout: 30_000 })
+        .then(() => true)
+        .catch(() => false);
+
+    if (visible) return dateInput;
+
+    console.log(`[bot] Date field not visible after refresh; re-selecting floor ${bldg.floor}…`);
+    await selectFloor(page, bldg);
+    return dateInput;
+}
+
 // ─── Booking Attempt ─────────────────────────────────────────────────────────
 async function attemptBooking() {
     if (!CONFIG.user || !CONFIG.pass) {
@@ -482,61 +513,41 @@ async function attemptBooking() {
 
         // ── Step 4: Select Floor ──────────────────────────────────────────────
         console.log(`[bot] Step 4: Selecting floor ${bldg.floor}…`);
-        await page.waitForSelector("text=Workspace booking", { timeout: 20_000 });
-        const floorLink = page.locator(`a[aria-label*="Select floor ${bldg.floor}"]`).first();
-        if (await floorLink.isVisible().catch(() => false)) {
-            await floorLink.click();
-        } else {
-            await page.locator(`text="${bldg.floor}"`).first().click();
-        }
-        await page.locator("#startDate").waitFor({ state: "visible", timeout: 20_000 });
-
-        // Prime the date immediately while the React component is fresh.
-        // fill() silently fails if the field sits idle for ~100s — React goes stale.
-        {
-            const di = page.locator("#startDate");
-            const primedFinal = await setStartDate(page, di, fmtDate(target), abortableSleep);
-            console.log(`[bot] Date primed: ${primedFinal}`);
-        }
+        await selectFloor(page, bldg);
 
         writeStatus(target, instance, "floor_loaded");
+        console.log(`[bot][i${instance}] Floor loaded. Will refresh before date entry.`);
         abort();
 
-        // ── Wait for strike time ──────────────────────────────────────────────
+        // ── Wait for refresh/search time ──────────────────────────────────────
         const now = new Date();
-        const strikeTime = new Date();
-        strikeTime.setHours(12, 0, 5, 0);
-        const msToWait = strikeTime.getTime() - now.getTime();
+        const refreshTime = searchRefreshTime(now);
+        const msToWait = refreshTime.getTime() - now.getTime();
 
         if (msToWait > 0) {
-            writeStatus(target, instance, `waiting_strike:${Math.round(msToWait / 1000)}s`);
-            console.log(`[bot][i${instance}] Pre-loaded. Waiting ${Math.round(msToWait / 1000)}s until 12:00:05…`);
+            writeStatus(target, instance, `waiting_refresh:${Math.round(msToWait / 1000)}s`);
+            console.log(`[bot][i${instance}] Pre-loaded. Waiting ${Math.round(msToWait / 1000)}s until 12:00:30 refresh…`);
             if (msToWait > 600) await abortableSleep(msToWait - 600);
-            while (Date.now() < strikeTime.getTime()) { /* busy-wait last 600ms */ }
-            console.log(`[bot][i${instance}] STRIKE — 12:00:05`);
+            while (Date.now() < refreshTime.getTime()) { /* busy-wait last 600ms */ }
+            console.log(`[bot][i${instance}] REFRESH — 12:00:30`);
         } else if (msToWait < -60000) {
-            console.log(`[bot][i${instance}] Outside pre-load window, proceeding immediately`);
+            console.log(`[bot][i${instance}] Outside pre-load window, refreshing immediately`);
         } else {
-            console.log(`[bot][i${instance}] Strike passed by ${Math.round(-msToWait / 1000)}s, proceeding`);
+            console.log(`[bot][i${instance}] Refresh time passed by ${Math.round(-msToWait / 1000)}s, refreshing now`);
         }
 
         abort(); // last check before the race begins
 
-        // ── Step 5: Verify/Re-set Date ────────────────────────────────────────
+        // ── Step 5: Refresh and Set Date ──────────────────────────────────────
+        writeStatus(target, instance, "refreshing_search_page");
+        console.log(`[bot][i${instance}] Refreshing search page before date entry…`);
+        await page.reload({ waitUntil: "domcontentloaded" });
+        const dateInput = await dateInputAfterRefresh(page, bldg);
+        await abortableSleep(500);
+
         writeStatus(target, instance, "setting_date");
-        const dateInput = page.locator("#startDate");
-
-        let appliedDate = await dateInput.inputValue().catch(() => "");
-        if (appliedDate === fmtDate(target)) {
-            console.log(`[bot] Date confirmed (pre-set): ${appliedDate}`);
-        } else {
-            // Date was reset during the wait — try to set it again
-            console.log(`[bot] Step 5: Date reset to "${appliedDate}", re-setting to ${fmtDate(target)}…`);
-            await abortableSleep(msToWait <= 0 ? 5000 : 2000);
-
-            appliedDate = await setStartDate(page, dateInput, fmtDate(target), abortableSleep);
-            console.log(`[bot] Date confirmed: ${appliedDate}`);
-        }
+        const appliedDate = await setStartDate(page, dateInput, fmtDate(target), abortableSleep);
+        console.log(`[bot] Date confirmed after refresh: ${appliedDate}`);
 
         // ── Step 6: Search ────────────────────────────────────────────────────
         writeStatus(target, instance, "searching");
@@ -795,4 +806,4 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     main();
 }
 
-export { fmtDate, setStartDate };
+export { fmtDate, searchRefreshTime, setStartDate };

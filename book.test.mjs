@@ -1,6 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { setStartDate } from "./book.mjs";
+import { searchRefreshTime, setStartDate } from "./book.mjs";
+
+test("searchRefreshTime targets 12:00:30 on the current day", () => {
+    const now = new Date("2026-07-24T11:58:10-04:00");
+    const strike = searchRefreshTime(now);
+
+    assert.equal(strike.getHours(), 12);
+    assert.equal(strike.getMinutes(), 0);
+    assert.equal(strike.getSeconds(), 30);
+    assert.equal(strike.getMilliseconds(), 0);
+    assert.equal(strike.getFullYear(), now.getFullYear());
+    assert.equal(strike.getMonth(), now.getMonth());
+    assert.equal(strike.getDate(), now.getDate());
+});
 
 test("setStartDate retries alternate date entry methods until the target date sticks", async () => {
     const expected = "06/22/2026";

@@ -17,7 +17,7 @@ Automatically books workspace desks in **Archibus** (Eptura/Horizant) **29 days 
 | **Wednesday** | Thursday | **A** — 270 Albert St, Floor 06, Room WS06-072 |
 | **Thursday** | Friday | **B** — Place d'Orléans, Floor 02, Room D2-106 |
 
-Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor page, then strikes at exactly **12:00:05 PM** to select date and search for rooms.
+Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor page. At **12:00:30 PM**, each instance refreshes the search page, enters the target date, and searches for rooms.
 
 ---
 
@@ -43,7 +43,7 @@ Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor pa
 1. **Native, not Docker** — moved from OpenClaw Docker container to native Node.js for simplicity and reliability.
 2. **Systemd user timer** — survives reboots (linger enabled), auto-runs missed jobs (`Persistent=true`).
 3. **Deterministic** — no LLM; same clicks every time. Fallback room logic if preferred room is taken.
-4. **Parallel Racing** — launches 3 instances on Orleans days to target 3 different rooms simultaneously at 12:00:05.
+4. **Parallel Racing** — launches 3 instances on Orleans days to target 3 different rooms after the 12:00:30 refresh.
 5. **Atomic Locking** — uses a `/tmp/*.lock` file with `O_EXCL` to ensure only one instance actually clicks "BOOK".
 6. **Telegram notifications** — sends status (✅ booked, 🧪 dry run, ❌ failed, ⏭️ no-op, 🤝 stood down) via bot API.
 
@@ -69,12 +69,12 @@ TELEGRAM_CHAT_ID=<chat_id>
 
 1. Calculate target date: `today + 29 days`.
 2. **Parallel Launch**: `run-booking.sh` forks 3 `node book.mjs` processes with `BOOKING_INSTANCE=1,2,3`.
-3. **Pre-load Phase** (11:58:00 - 12:00:00):
+3. **Pre-load Phase** (11:58:00 - 12:00:30):
    - Navigate to Archibus, log in.
    - Select building (Instance 1/2/3 each get a different primary room assigned).
-   - Select floor, wait on the search page.
-4. **Strike Phase** (12:00:05 PM):
-   - All 3 instances inject date via `evaluate()` and click Search simultaneously.
+   - Select floor, wait on the search page without entering the date.
+4. **Refresh/Search Phase** (12:00:30 PM):
+   - All 3 instances refresh the search page, re-detect the date field, enter the target date, and click Search.
 5. **Coordination Phase**:
    - Each instance finds its target room and opens the panel.
    - **Critical**: Before clicking "BOOK", each instance tries to create `/tmp/booking-bot-YYYY-MM-DD.lock`.
@@ -238,6 +238,10 @@ Added early-return block to `~/.bashrc` for `ANTIGRAVITY_AGENT` env var to preve
 - **2026-02-14**: Created by AI assistant. Replaced OpenClaw AI automation with deterministic Playwright script.
 - **2026-02-18**: Migrated from Docker to native Node.js at `/mnt/wdc/BookingBot/`. Set up systemd user timer. Applied terminal blindness fix to `~/.bashrc`. Ran missed booking for Thu Mar 19 → ✅ Room WS06-072 booked.
 ## Recent Updates
+
+## 2026-06-28: Refresh before date entry at 12:00:30
+
+Recent failures showed the pre-loaded Archibus page could sit stale or freeze before the date/search step, causing the bot to miss approved rooms during the noon rush. The bot now waits on the floor page without entering the date, refreshes at **12:00:30 PM**, re-detects `#startDate`, enters the target date, then clicks Search. If the refresh drops the floor selection, it re-selects the floor before setting the date. Added `searchRefreshTime()` regression coverage for the fixed 12:00:30 timing.
 
 ## 2026-05-24: Date field priming still failed during real pre-load
 
