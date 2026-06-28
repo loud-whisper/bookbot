@@ -241,7 +241,9 @@ Added early-return block to `~/.bashrc` for `ANTIGRAVITY_AGENT` env var to preve
 
 ## 2026-06-28: Refresh before date entry at 12:00:30
 
-Recent failures showed the pre-loaded Archibus page could sit stale or freeze before the date/search step, causing the bot to miss approved rooms during the noon rush. The bot now waits on the floor page without entering the date, refreshes at **12:00:30 PM**, re-detects `#startDate`, enters the target date, then clicks Search. If the refresh drops the floor selection, it re-selects the floor before setting the date. Added `searchRefreshTime()` regression coverage for the fixed 12:00:30 timing.
+Recent failures showed the pre-loaded Archibus page could sit stale or freeze before the date/search step, causing the bot to miss approved rooms during the noon rush. The bot now waits on the floor page without entering the date, refreshes at **12:00:30 PM**, re-detects `#startDate`, enters the target date, then clicks Search. Added `searchRefreshTime()` regression coverage for the fixed 12:00:30 timing.
+
+The first live run after this change exposed a second refresh failure: all three instances reached the floor page, refreshed at 12:00:30, then `#startDate` disappeared. The old recovery only tried to re-select the floor and timed out waiting for `text=Workspace booking` because the hard refresh had dropped the app out of the workspace-booking view. Fix: when the date field is missing after refresh, reopen the explicit Archibus booking-task URL, select the building, open Book workspaces, select the floor again, and only then set the date. Added `dateInputAfterRefresh()` regression coverage. A dry run confirmed the bot now gets past refresh recovery, sets `07/27/2026`, and searches successfully; that run then found no currently approved Building A rooms (`WS06-072` or `WS06-052`) available for that target date.
 
 ## 2026-05-24: Date field priming still failed during real pre-load
 

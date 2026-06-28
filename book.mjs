@@ -345,7 +345,31 @@ async function selectFloor(page, bldg) {
     await page.locator("#startDate").waitFor({ state: "visible", timeout: 20_000 });
 }
 
-async function dateInputAfterRefresh(page, bldg) {
+async function openBookingFlow(page, bldg, bldgKey, abortableSleep, abort) {
+    console.log(`[bot] Step 2: Selecting building ${bldgKey}…`);
+    const buildingLink = page.locator(`text=${bldg.name}`).first();
+    if (await buildingLink.isVisible().catch(() => false)) {
+        await buildingLink.click();
+    } else {
+        const searchInput = page.locator('input[placeholder*="Search for a building"]');
+        if (await searchInput.isVisible().catch(() => false)) {
+            await searchInput.fill(bldg.searchText);
+            await abortableSleep(1500);
+        }
+        await page.locator(`text=${bldg.name}`).first().click();
+    }
+    await page.locator("text=Book workspaces").first().waitFor({ state: "visible", timeout: 30_000 });
+
+    abort();
+
+    console.log("[bot] Step 3: Opening 'Book workspaces'…");
+    await page.locator("text=Book workspaces").first().click();
+
+    console.log(`[bot] Step 4: Selecting floor ${bldg.floor}…`);
+    await selectFloor(page, bldg);
+}
+
+async function dateInputAfterRefresh(page, bldg, reopenBookingFlow = null) {
     const dateInput = page.locator("#startDate");
     const visible = await dateInput
         .waitFor({ state: "visible", timeout: 30_000 })
@@ -353,6 +377,13 @@ async function dateInputAfterRefresh(page, bldg) {
         .catch(() => false);
 
     if (visible) return dateInput;
+
+    if (reopenBookingFlow) {
+        console.log(`[bot] Date field not visible after refresh; reopening booking flow for floor ${bldg.floor}…`);
+        await reopenBookingFlow();
+        await dateInput.waitFor({ state: "visible", timeout: 30_000 });
+        return dateInput;
+    }
 
     console.log(`[bot] Date field not visible after refresh; re-selecting floor ${bldg.floor}…`);
     await selectFloor(page, bldg);
@@ -490,30 +521,8 @@ async function attemptBooking() {
         abort();
         console.log("[bot] Step 1 complete");
 
-        // ── Step 2: Select Building ───────────────────────────────────────────
-        console.log(`[bot] Step 2: Selecting building ${bldgKey}…`);
-        const buildingLink = page.locator(`text=${bldg.name}`).first();
-        if (await buildingLink.isVisible().catch(() => false)) {
-            await buildingLink.click();
-        } else {
-            const searchInput = page.locator('input[placeholder*="Search for a building"]');
-            if (await searchInput.isVisible().catch(() => false)) {
-                await searchInput.fill(bldg.searchText);
-                await abortableSleep(1500);
-            }
-            await page.locator(`text=${bldg.name}`).first().click();
-        }
-        await page.locator("text=Book workspaces").first().waitFor({ state: "visible", timeout: 30_000 });
-
-        abort();
-
-        // ── Step 3: Book workspaces ───────────────────────────────────────────
-        console.log("[bot] Step 3: Opening 'Book workspaces'…");
-        await page.locator("text=Book workspaces").first().click();
-
-        // ── Step 4: Select Floor ──────────────────────────────────────────────
-        console.log(`[bot] Step 4: Selecting floor ${bldg.floor}…`);
-        await selectFloor(page, bldg);
+        // ── Steps 2-4: Select Building, Book Workspaces, Select Floor ─────────
+        await openBookingFlow(page, bldg, bldgKey, abortableSleep, abort);
 
         writeStatus(target, instance, "floor_loaded");
         console.log(`[bot][i${instance}] Floor loaded. Will refresh before date entry.`);
@@ -542,7 +551,12 @@ async function attemptBooking() {
         writeStatus(target, instance, "refreshing_search_page");
         console.log(`[bot][i${instance}] Refreshing search page before date entry…`);
         await page.reload({ waitUntil: "domcontentloaded" });
-        const dateInput = await dateInputAfterRefresh(page, bldg);
+        const dateInput = await dateInputAfterRefresh(page, bldg, async () => {
+            console.log("[bot] Reopening booking task after refresh lost the search form…");
+            await page.goto(CONFIG.bookingUrl, { waitUntil: "domcontentloaded" });
+            await abortableSleep(3000);
+            await openBookingFlow(page, bldg, bldgKey, abortableSleep, abort);
+        });
         await abortableSleep(500);
 
         writeStatus(target, instance, "setting_date");
@@ -806,4 +820,4 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     main();
 }
 
-export { fmtDate, searchRefreshTime, setStartDate };
+export { dateInputAfterRefresh, fmtDate, searchRefreshTime, setStartDate };

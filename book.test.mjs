@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { searchRefreshTime, setStartDate } from "./book.mjs";
+import { dateInputAfterRefresh, searchRefreshTime, setStartDate } from "./book.mjs";
 
 test("searchRefreshTime targets 12:00:30 on the current day", () => {
     const now = new Date("2026-07-24T11:58:10-04:00");
@@ -63,4 +63,34 @@ test("setStartDate retries alternate date entry methods until the target date st
         "press:Tab",
         "evaluate:06/22/2026",
     ]);
+});
+
+test("dateInputAfterRefresh reopens the booking flow when refresh loses the date field", async () => {
+    let waitCount = 0;
+    let reopened = false;
+    const dateInput = {
+        async waitFor() {
+            waitCount++;
+            if (waitCount === 1) {
+                throw new Error("date field missing after refresh");
+            }
+        },
+    };
+    const page = {
+        locator(selector) {
+            assert.equal(selector, "#startDate");
+            return dateInput;
+        },
+        async waitForSelector(selector) {
+            throw new Error(`should reopen booking flow, not wait for ${selector}`);
+        },
+    };
+
+    const returned = await dateInputAfterRefresh(page, { floor: "06" }, async () => {
+        reopened = true;
+    });
+
+    assert.equal(returned, dateInput);
+    assert.equal(reopened, true);
+    assert.equal(waitCount, 2);
 });
