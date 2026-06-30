@@ -14,10 +14,12 @@ Automatically books workspace desks in **Archibus** (Eptura/Horizant) **29 days 
 | Timer fires on | Books for (today + 29d) | Building |
 |---|---|---|
 | **Sunday** | Monday | **A** — 270 Albert St, Floor 06, Room WS06-072 |
+| **Monday** | Tuesday | **B** — Place d'Orléans, Floor 02, Room D2-190-1 preferred |
 | **Wednesday** | Thursday | **A** — 270 Albert St, Floor 06, Room WS06-072 |
-| **Thursday** | Friday | **B** — Place d'Orléans, Floor 02, Room D2-106 |
+| **Thursday** | Friday | **B** — Place d'Orléans, Floor 02, Room D2-190-1 preferred |
 
 Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor page. At **12:00:30 PM**, each instance refreshes the search page, enters the target date, and searches for rooms.
+There is intentionally no Tuesday timer, because a Tuesday run would target Wednesday (`today + 29d`) and the bot has no Wednesday booking policy.
 
 ---
 
@@ -36,7 +38,7 @@ Timer fires at **11:58:00 AM ET** (no jitter) to pre-load browser/login/floor pa
 ### Systemd Units (user-level)
 
 - **`~/.config/systemd/user/booking-bot.service`** — oneshot service, runs `run-booking.sh`
-- **`~/.config/systemd/user/booking-bot.timer`** — fires Sun/Wed/Thu 11:58:00, `Persistent=true`
+- **`~/.config/systemd/user/booking-bot.timer`** — fires Sun/Mon/Wed/Thu 11:58:00, `Persistent=true`
 
 ### Key Design Decisions
 
